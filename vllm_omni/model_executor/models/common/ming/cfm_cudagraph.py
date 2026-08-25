@@ -89,13 +89,23 @@ class CFMGraphExecutor:
         return build_timesteps(self.steps, device=device, dtype=torch.float32, use_epss=True, sway_sampling_coef=-1.0)
 
     @torch.no_grad()
-    def execute(self, llm_cond, his_lat, cfg_strength, sigma, temperature):
+    def execute(self, llm_cond, his_lat, cfg_strength, sigma, temperature, generator=None):
         bsz = llm_cond.shape[0]
         device = llm_cond.device
         # ODE state / noise / timesteps are float32 to match the eager path.
-        y0 = torch.randn((bsz, self.patch_size, self.latent_dim), device=device, dtype=torch.float32)
+        y0 = torch.randn(
+            (bsz, self.patch_size, self.latent_dim),
+            device=device,
+            dtype=torch.float32,
+            generator=generator,
+        )
         t = self._timesteps(device)
-        sde_rnd = torch.randn((self.steps, bsz, self.patch_size, self.latent_dim), device=device, dtype=torch.float32)
+        sde_rnd = torch.randn(
+            (self.steps, bsz, self.patch_size, self.latent_dim),
+            device=device,
+            dtype=torch.float32,
+            generator=generator,
+        )
 
         if not self.initialized:
             self._initialize_graph(llm_cond, his_lat, y0, t, sde_rnd)
