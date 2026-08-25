@@ -37,11 +37,12 @@ def build_timesteps(steps, device, dtype, use_epss=True, sway_sampling_coef=-1.0
 
 
 class Solver:
-    def __init__(self, func, y0, sigma=0.25, temperature=1.5) -> None:
+    def __init__(self, func, y0, sigma=0.25, temperature=1.5, generator=None) -> None:
         self.func = func
         self.y0 = y0
         self.sigma = sigma
         self.temperature = temperature
+        self.generator = generator
 
     def integrate(self, t):
         solution = torch.empty(len(t), *self.y0.shape, dtype=self.y0.dtype, device=self.y0.device)
@@ -59,7 +60,12 @@ class Solver:
                 solution[j] = self._linear_interp(t0, t1, y0, y1, t[j])
                 j += 1
 
-            noise = torch.randn_like(y0)
+            noise = torch.randn(
+                y0.shape,
+                device=y0.device,
+                dtype=y0.dtype,
+                generator=self.generator,
+            )
             shift = self.sigma * (self.temperature**0.5) * (abs(dt) ** 0.5) * noise
             y0 = y1 + shift
 

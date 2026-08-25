@@ -21,7 +21,16 @@ class FlowLoss(nn.Module):
         self.cfm.add_module("model", DiT(in_channels=z_channels, llm_cond_dim=llm_cond_dim, **kwargs))
 
     @torch.no_grad()
-    def sample(self, z, latent_history, cfg=2.0, patch_size=1, sigma=0.25, temperature=0):
+    def sample(
+        self,
+        z,
+        latent_history,
+        cfg=2.0,
+        patch_size=1,
+        sigma=0.25,
+        temperature=0,
+        generator=None,
+    ):
         # z: [Batch, Time=1, Dimension]
         # latent_history: [Batch, History_Time, Dimension]
         if z.ndim != 3:
@@ -35,7 +44,14 @@ class FlowLoss(nn.Module):
                 f"Batch mismatch across conditioning and latent_history: {z.shape[0]}, {latent_history.shape[0]}"
             )
         dtype = z.dtype
-        noise = torch.randn(z.shape[0], self.z_channels, patch_size, device=z.device, dtype=torch.float32)
+        noise = torch.randn(
+            z.shape[0],
+            self.z_channels,
+            patch_size,
+            device=z.device,
+            dtype=torch.float32,
+            generator=generator,
+        )
 
         def fn(t, x):
             x = x.to(dtype)
@@ -59,4 +75,14 @@ class FlowLoss(nn.Module):
             use_epss=True,
             sway_sampling_coef=-1.0,
         )
-        return Solver(fn, noise.transpose(1, 2), sigma=sigma, temperature=temperature).integrate(t)[-1].to(dtype)
+        return (
+            Solver(
+                fn,
+                noise.transpose(1, 2),
+                sigma=sigma,
+                temperature=temperature,
+                generator=generator,
+            )
+            .integrate(t)[-1]
+            .to(dtype)
+        )

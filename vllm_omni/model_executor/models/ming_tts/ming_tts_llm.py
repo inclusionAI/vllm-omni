@@ -24,6 +24,7 @@ from vllm_omni.model_executor.models.common.ming.cfm_cudagraph import (
     CFMSampler,
 )
 from vllm_omni.model_executor.models.common.ming.cfm_head import FlowLoss
+from vllm_omni.model_executor.models.common.ming.continuous_tts import STOP_REASON_CODES
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
 from .config_ming_tts import (
@@ -35,17 +36,13 @@ from .config_ming_tts import (
     KEY_NEXT_EMBEDS,
     KEY_REQUEST_ID,
     KEY_SIGMA,
+    KEY_STOP_REASON,
     KEY_TEMPERATURE,
     KEY_TEXT_MODE,
     MingTTSConfig,
 )
 from .constants import SPEAKER_EMBEDDING_DIM
 from .patch_emission import (
-    MING_STOP_REASON_CODES,
-    MING_STOP_REASON_CONTINUE,
-    MING_STOP_REASON_KEY,
-    MING_STOP_REASON_MAX_DECODE_STEPS,
-    MING_STOP_REASON_STOP_HEAD,
     _coerce_latent_history,
     _get_request_token_counts,
     _normalize_request_infos,
@@ -63,6 +60,14 @@ _CFM_STEPS = 10
 
 
 class MingLLMModel(nn.Module):
+    latent_patch_key = "ming_latent_patch"
+    next_embeds_key = "ming_next_embeds"
+    new_history_key = "ming_new_history"
+    decode_step_key = "ming_decode_step"
+    has_patch_key = "ming_has_patch"
+    stop_reason_key = KEY_STOP_REASON
+    stop_probability_key = "ming_stop_prob"
+    stop_reason_codes = STOP_REASON_CODES
     # Drop the tensor on purpose, otherwise upstream vLLM would reject.
     # The vendor never reaches them either (audio_gate/image_gate never fire)
     # dropping them keeps routing identical to the reference implementation.
@@ -145,11 +150,7 @@ class MingLLMModel(nn.Module):
         if model_intermediate_buffer is None:
             model_intermediate_buffer = kwargs.get("runtime_additional_information")
         request_infos = _normalize_request_infos(model_intermediate_buffer)
-        _validate_ming_decode_window(
-            request_infos,
-            min_stop_step=int(self.ming_config.stop_head_min_steps),
-            default_max_decode_steps=self.ming_config.max_decode_steps,
-        )
+        self._validate_decode_window(request_infos)
         # Positional call: Qwen2Model names the 2nd arg ``positions`` while
         # BailingMoeModel names it ``position_ids`` — both share the signature
         # (input_ids, positions, intermediate_tensors, inputs_embeds).
@@ -213,6 +214,7 @@ class MingLLMModel(nn.Module):
                 cfg_scale=_resolve_runtime_float(req_info, KEY_CFG, self.ming_config.cfg),
                 sigma=_resolve_runtime_float(req_info, KEY_SIGMA, self.ming_config.sigma),
                 temperature=_resolve_runtime_float(req_info, KEY_TEMPERATURE, self.ming_config.temperature),
+                generator=self._get_request_generator(req_info, hidden_states.device),
             )
             req_max_decode_steps = _resolve_runtime_int(
                 req_info, KEY_MAX_DECODE_STEPS, self.ming_config.max_decode_steps
@@ -234,7 +236,7 @@ class MingLLMModel(nn.Module):
             new_history_tokens[output_index : output_index + 1] = new_history
             decode_step_tokens[output_index : output_index + 1] = decode_step
             has_patch[output_index : output_index + 1] = True
-            stop_reason, _, _, _, next_token_id = _resolve_ming_stop_decision(
+            stop_reason, _, _, _, next_token_id = self._resolve_stop_decision(
                 step=decode_step,
                 stop_prob=float(stop_probs.reshape(-1)[0].item()),
                 stop_threshold=float(self.ming_config.stop_head_threshold),
@@ -244,15 +246,16 @@ class MingLLMModel(nn.Module):
                 audio_dummy_token_id=int(self.ming_config.audio_dummy_token_id),
                 text_eos_token_id=int(self.ming_config.text_eos_token_id),
             )
-            stop_reason_code_tokens[output_index : output_index + 1] = MING_STOP_REASON_CODES[stop_reason]
+            stop_reason_code_tokens[output_index : output_index + 1] = self.stop_reason_codes[stop_reason]
+            self._on_stop_decision(req_info, stop_reason)
             next_token_ids.append(int(next_token_id))
             if isinstance(req_id, str):
                 pending_updates[req_id] = {
                     KEY_LATENT_HISTORY: new_history,
                     KEY_NEXT_EMBEDS: next_embeds,
-                    "ming_latent_patch": sampled_token_latent,
-                    "ming_stop_prob": stop_probs,
-                    MING_STOP_REASON_KEY: stop_reason,
+                    self.latent_patch_key: sampled_token_latent,
+                    self.stop_probability_key: stop_probs,
+                    self.stop_reason_key: stop_reason,
                 }
             any_decode = True
             cursor = end
@@ -267,18 +270,37 @@ class MingLLMModel(nn.Module):
         return OmniOutput(
             text_hidden_states=hidden_states,
             multimodal_outputs={
-                "ming_latent_patch": latent_patch_tokens,
-                "ming_next_embeds": next_embed_tokens,
-                "ming_new_history": new_history_tokens,
-                "ming_decode_step": decode_step_tokens,
-                "ming_has_patch": has_patch,
-                MING_STOP_REASON_KEY: stop_reason_code_tokens,
+                self.latent_patch_key: latent_patch_tokens,
+                self.next_embeds_key: next_embed_tokens,
+                self.new_history_key: new_history_tokens,
+                self.decode_step_key: decode_step_tokens,
+                self.has_patch_key: has_patch,
+                self.stop_reason_key: stop_reason_code_tokens,
             },
             intermediate_tensors=intermediate_tensors,
         )
 
     def pop_postprocess_update(self, req_id: str) -> dict[str, Any]:
         return self._pending_postprocess_updates.pop(req_id, {}) if isinstance(req_id, str) else {}
+
+    def _validate_decode_window(self, request_infos: list[dict[str, Any]]) -> None:
+        _validate_ming_decode_window(
+            request_infos,
+            min_stop_step=int(self.ming_config.stop_head_min_steps),
+            default_max_decode_steps=self.ming_config.max_decode_steps,
+        )
+
+    def _resolve_stop_decision(self, **kwargs: Any) -> tuple[str, bool, bool, int, int]:
+        return _resolve_ming_stop_decision(**kwargs)
+
+    def _get_request_generator(self, req_info: dict[str, Any], device: torch.device) -> torch.Generator | None:
+        """Return a request-scoped RNG; No-op for this base MingLLMModel - use the default RNG."""
+        del req_info, device
+        return None
+
+    def _on_stop_decision(self, req_info: dict[str, Any], stop_reason: str) -> None:
+        """Handle stop-related cleanup; No-op for this base MingLLMModel."""
+        del req_info, stop_reason
 
     def compute_logits(self, hidden_states: torch.Tensor, sampling_metadata: SamplingMetadata) -> torch.Tensor | None:
         del sampling_metadata
@@ -384,6 +406,7 @@ class MingLLMModel(nn.Module):
         cfg_scale: float,
         sigma: float,
         temperature: float,
+        generator: torch.Generator | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if hidden_states.dim() != 2:
             raise RuntimeError(f"Expected decode hidden_states rank-2 [B,H], got {tuple(hidden_states.shape)}")
@@ -410,7 +433,12 @@ class MingLLMModel(nn.Module):
         if graph_exec is not None:
             try:
                 sampled_token_latent, next_embeds, stop_full = graph_exec.execute(
-                    z_diff_cond, latent_history, cfg_scale, sigma, temperature
+                    z_diff_cond,
+                    latent_history,
+                    cfg_scale,
+                    sigma,
+                    temperature,
+                    generator=generator,
                 )
                 stop_probs = stop_full[:, 1]
             except Exception as exc:
@@ -427,6 +455,7 @@ class MingLLMModel(nn.Module):
                 patch_size=self.ming_config.patch_size,
                 sigma=sigma,
                 temperature=temperature,
+                generator=generator,
             )
             # Aggregator expects [Batch, Time, Dimension] = [B, 4, 64] and returns [B, 1, H].
             next_embeds = self.linear_proj_audio(sampled_token_latent)
@@ -500,11 +529,6 @@ def _warn_missing_prefix(
 __all__ = [
     "Aggregator",
     "FlowLoss",
-    "MING_STOP_REASON_CODES",
-    "MING_STOP_REASON_CONTINUE",
-    "MING_STOP_REASON_KEY",
-    "MING_STOP_REASON_MAX_DECODE_STEPS",
-    "MING_STOP_REASON_STOP_HEAD",
     "MingLLMModel",
     "_coerce_latent_history",
     "_extract_hidden_states",
