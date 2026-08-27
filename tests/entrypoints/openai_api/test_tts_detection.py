@@ -283,14 +283,19 @@ def test_pipeline_stage_list_is_complete():
     assert not missing, f"stage keys claimed by adapters but absent from _PIPELINE_STAGES: {sorted(missing)}"
 
 
-def test_entry_stage_archs_is_ming_only():
-    """Only Ming dense identifies its entry stage by architecture.
+def test_entry_stage_archs_contains_arch_identified_tts_models():
+    """Models using generic llm stages identify their entry stage by architecture.
 
     Widening this set would change which stage ``_find_tts_stage`` selects in
     mixed deployments — notably VoxCPM2, which declares ``model_archs`` but is
     found by its ``latent_generator`` stage key.
     """
-    assert tts_entry_stage_archs() == frozenset({"MingTTSForConditionalGeneration"})
+    assert tts_entry_stage_archs() == frozenset(
+        {
+            "LingV3TTSForConditionalGeneration",
+            "MingTTSForConditionalGeneration",
+        }
+    )
 
 
 def test_every_detected_type_is_adapter_backed():
