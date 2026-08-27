@@ -76,6 +76,7 @@ EXPECTED_MODEL_TYPES = {
     "omnivoice",
     "covo_audio",
     "ming_tts",
+    "lingv3_tts",
     "moss_tts_nano",
     "moss_tts",
     "higgs_audio_v2",
@@ -989,6 +990,10 @@ def test_qwen3_tts_rejects_only_length_finished_base_audio(mocker):
     # engine terminal reason still makes this an unambiguous limit failure.
     with pytest.raises(Qwen3TTSCodecLimitError, match="191/192"):
         adapter.validate_generation(params, stage0_finish_reason="length", output_tokens=191)
+
+
+def test_detects_lingv3_by_architecture():
+    assert detect_tts_model_type("llm", "LingV3TTSForConditionalGeneration") == "lingv3_tts"
 
 
 def test_indextts_adapters_are_versioned():
