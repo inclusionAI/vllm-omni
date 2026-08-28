@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """OpenAI speech adapter for inclusionAI LingV3-TTS."""
 
 from __future__ import annotations
@@ -70,8 +70,12 @@ class LingV3TTSAdapter(ARTTSAdapter):
         if server._tts_tokenizer is None:
             model_name = server.engine_client.model_config.model
             trust_remote_code = bool(getattr(server.engine_client.model_config, "trust_remote_code", False))
-            server._tts_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
-        samples, sample_rate = await server._resolve_ref_audio(request.ref_audio)
+            server._tts_tokenizer = AutoTokenizer.from_pretrained(
+                model_name,
+                trust_remote_code=trust_remote_code,
+                fix_mistral_regex=True,
+            )
+        samples, sample_rate, _ = await server._resolve_ref_audio(request.ref_audio)
         prompt_dict = build_lingv3_prompt(
             server._tts_tokenizer,
             target_text=request.input,
