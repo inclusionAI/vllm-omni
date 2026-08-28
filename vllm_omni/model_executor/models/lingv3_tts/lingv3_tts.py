@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Two-stage vLLM-Omni wrapper for LingV3-TTS."""
 
 from __future__ import annotations
@@ -161,7 +161,15 @@ class LingV3TTSForConditionalGeneration(
         input_embeds: torch.Tensor,
         info: dict[str, Any],
     ):
-        prompt_latents = _resolve_prompt_latents(self, info)
+        prompt_generator = None
+        if info.get("prompt_waveform") is not None:
+            prompt_generator = self.model._get_request_generator(info, input_embeds.device)
+        prompt_latents = _resolve_prompt_latents(
+            self,
+            info,
+            generator=prompt_generator,
+            posterior_parameterization="clamped_logvar",
+        )
         history = _initial_history(
             prompt_latents["frames"] if prompt_latents is not None else None,
             history_size=self.ming_config.history_patch_size,

@@ -1024,6 +1024,21 @@ def test_lingv3_build_accepts_resolver_cache_key(mocker):
     assert prepared.model_type == "lingv3_tts"
 
 
+def test_lingv3_sampling_overrides_attach_request_rng_state():
+    adapter = LingV3TTSAdapter(SimpleNamespace(server=SimpleNamespace()))
+    defaults = [SimpleNamespace(max_tokens=801, stop_token_ids=None)]
+    prompt: dict[str, Any] = {"additional_information": {}}
+    request = SimpleNamespace(max_new_tokens=200, seed=1234)
+
+    overridden = adapter.apply_sampling_overrides(defaults, request, prompt, "request-1")
+
+    assert overridden[0].max_tokens == 201
+    assert prompt["additional_information"] == {
+        "lingv3_request_id": "request-1",
+        "tts_local_seed": 1234,
+    }
+
+
 def test_lingv3_requires_reference_audio():
     request = SimpleNamespace(input="hello", ref_audio=None)
     adapter = LingV3TTSAdapter(SimpleNamespace(server=SimpleNamespace()))

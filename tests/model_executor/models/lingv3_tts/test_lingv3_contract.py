@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from types import SimpleNamespace
+from typing import Any
+
 import pytest
+import torch
 
 from vllm_omni.model_executor.models.common.ming.continuous_tts import (
     STOP_REASON_CONTINUE,
@@ -19,6 +23,12 @@ from vllm_omni.model_executor.models.lingv3_tts.constants import (
     AUDIO_START_TOKEN_ID,
     SPEAKER_END_TOKEN_ID,
     SPEAKER_START_TOKEN_ID,
+)
+from vllm_omni.model_executor.models.lingv3_tts.lingv3_tts import (
+    LingV3TTSForConditionalGeneration,
+)
+from vllm_omni.model_executor.models.lingv3_tts.lingv3_tts_llm import (
+    LingV3TTSLLMModel,
 )
 from vllm_omni.model_executor.models.lingv3_tts.prompt_assembly import (
     ASSISTANT_PREFIX,
@@ -142,6 +152,69 @@ def test_prompt_contract_concatenates_reference_and_target_without_separator():
     text_start = len(tokenizer.encode(USER_PREFIX)) + 3 + len(tokenizer.encode(TEXT_PREFIX))
     assert ids[text_start : text_start + len(joined)] == joined
     assert ids[prompt_position:] == [AUDIO_PATCH_TOKEN_ID] * 3
+
+
+def test_prefill_uses_vendor_prompt_posterior_and_continues_request_rng(monkeypatch):
+    generator = torch.Generator().manual_seed(17)
+    calls: dict[str, Any] = {}
+
+    def get_request_generator(info, device):
+        calls["generator_request"] = (info, device)
+        return generator
+
+    def resolve_prompt_latents(wrapper, info, **kwargs):
+        calls["prompt"] = (wrapper, info, kwargs)
+        return None
+
+    from vllm_omni.model_executor.models.lingv3_tts import lingv3_tts as model_module
+
+    monkeypatch.setattr(model_module, "_resolve_prompt_latents", resolve_prompt_latents)
+    monkeypatch.setattr(model_module, "resolve_speaker_embeddings", lambda wrapper, info: [torch.zeros(192)])
+    monkeypatch.setattr(model_module, "_find_speaker_placeholder_positions", lambda input_ids, config: [0])
+
+    model = SimpleNamespace(
+        _get_request_generator=get_request_generator,
+        fm_dtype=torch.float32,
+        project_speaker_embedding=lambda embedding: torch.zeros((1, 4)),
+    )
+    wrapper = SimpleNamespace(
+        model=model,
+        ming_config=SimpleNamespace(history_patch_size=1, latent_dim=64),
+        _copy_request_state=lambda update, info: None,
+    )
+    info = {"prompt_waveform": torch.ones((1, 8)), "request_id": "request-1"}
+
+    LingV3TTSForConditionalGeneration._prefill_preprocess(
+        wrapper,
+        torch.tensor([AUDIO_PATCH_TOKEN_ID]),
+        torch.zeros((1, 4)),
+        info,
+    )
+
+    assert calls["generator_request"] == (info, torch.device("cpu"))
+    assert calls["prompt"][2] == {
+        "generator": generator,
+        "posterior_parameterization": "clamped_logvar",
+    }
+
+
+@pytest.mark.parametrize(
+    ("info", "expected_seed"),
+    [
+        pytest.param({"request_id": "request-1", "tts_local_seed": 1234}, 1234, id="explicit-seed"),
+        pytest.param({"request_id": "request-1"}, None, id="unseeded-speaker"),
+    ],
+)
+def test_request_generator_seed_policy(info, expected_seed):
+    model = SimpleNamespace(_request_generators={})
+    generator = LingV3TTSLLMModel._get_request_generator(
+        model,
+        info,
+        torch.device("cpu"),
+    )
+
+    actual_seed = None if generator is None else generator.initial_seed()
+    assert actual_seed == expected_seed
 
 
 def test_tokenizer_mismatch_is_not_repaired():

@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """LingV3 continuous-latent AR stage."""
 
 from __future__ import annotations
 
-import hashlib
 import os
 from collections.abc import Iterable
 from typing import Any
@@ -107,6 +106,7 @@ class LingV3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
         self._last_text_mode = False
         self._cfm_graph = None
         self._cfm_graph_enabled = os.environ.get("LINGV3_CFM_CUDAGRAPH", "1") == "1"
+        print(f" >>> self._cfm_graph_enabled: {self._cfm_graph_enabled}")
         self._request_generators: dict[str, torch.Generator] = {}
 
     def make_empty_intermediate_tensors(self, *args: Any, **kwargs: Any):
@@ -166,7 +166,7 @@ class LingV3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
         )
 
     def _get_request_generator(self, req_info: dict[str, Any], device: torch.device) -> torch.Generator | None:
-        request_id = req_info.get(KEY_REQUEST_ID)
+        request_id = req_info.get(KEY_REQUEST_ID, req_info.get("request_id"))
         if not isinstance(request_id, str) or not request_id:
             return None
         generator = self._request_generators.get(request_id)
@@ -174,10 +174,11 @@ class LingV3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
             return generator
         raw_seed = req_info.get("tts_local_seed")
         if raw_seed is None:
+            if req_info.get("prompt_waveform") is None:
+                return None
             raw_seed = torch.seed()
-        request_salt = int.from_bytes(hashlib.blake2b(request_id.encode(), digest_size=8).digest(), "little")
         generator = torch.Generator(device=device)
-        generator.manual_seed((int(raw_seed) + request_salt) % (2**63 - 1))
+        generator.manual_seed(int(raw_seed))
         self._request_generators[request_id] = generator
         return generator
 
