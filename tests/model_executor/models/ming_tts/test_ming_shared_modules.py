@@ -12,7 +12,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import (
     parse_ming_instruction_fields,
 )
 from vllm_omni.model_executor.models.common.ming.aggregator import Aggregator
-from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAEConfig
+from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE, AudioVAEConfig
 from vllm_omni.model_executor.models.common.ming.cfm_cudagraph import CFMGraphExecutor, CFMSampler
 from vllm_omni.model_executor.models.common.ming.cfm_dit import DiT
 from vllm_omni.model_executor.models.common.ming.cfm_head import FlowLoss
@@ -49,6 +49,42 @@ def test_ming_tts_audio_vae_uses_common_config():
 
     assert cfg.sample_rate == 16000
     assert cfg.patch_size == -1
+
+
+class _FixedPosteriorEncoder:
+    def __init__(self, parameters):
+        self.parameters = parameters
+
+    def __call__(self, waveform):
+        return self.parameters.to(waveform), None
+
+
+@pytest.mark.parametrize("parameterization", ["softplus_scale", "clamped_logvar"])
+def test_audio_vae_posterior_parameterization(parameterization):
+    encoded = torch.tensor([[[1.0, 0.0], [2.0, 4.0]]])
+    vae = SimpleNamespace(
+        config=SimpleNamespace(enc_kwargs={"input_dim": 1}, patch_size=-1),
+        encoder=_FixedPosteriorEncoder(encoded),
+    )
+    generator = torch.Generator().manual_seed(17)
+    expected_generator = torch.Generator().manual_seed(17)
+    mean, parameter = torch.chunk(encoded.transpose(1, 2), 2, dim=1)
+    if parameterization == "softplus_scale":
+        std = torch.nn.functional.softplus(parameter) + 1e-4
+    else:
+        std = torch.exp(0.5 * torch.clamp(parameter, -30.0, 20.0))
+    expected_noise = torch.randn(mean.shape, generator=expected_generator)
+
+    actual, lengths = AudioVAE.encode_latent(
+        vae,
+        torch.zeros((1, 2)),
+        torch.tensor([2]),
+        generator=generator,
+        posterior_parameterization=parameterization,
+    )
+
+    torch.testing.assert_close(actual, (mean + std * expected_noise).transpose(1, 2))
+    assert torch.equal(lengths, torch.tensor([2], dtype=torch.int32))
 
 
 def test_ming_tts_cfm_solver_uses_common_implementation():

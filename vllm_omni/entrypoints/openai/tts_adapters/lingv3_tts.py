@@ -15,6 +15,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
 from vllm_omni.model_executor.models.lingv3_tts.constants import (
     AUDIO_END_TOKEN_ID,
+    KEY_REQUEST_ID,
     MAX_DECODE_STEPS,
 )
 from vllm_omni.model_executor.models.lingv3_tts.prompt_assembly import (
@@ -101,11 +102,17 @@ class LingV3TTSAdapter(ARTTSAdapter):
         prompt: dict[str, Any] | None = None,
         request_id: str | None = None,
     ) -> list:
-        del prompt, request_id
         updated = copy.deepcopy(sampling_params_list)
         updated[0].stop_token_ids = [AUDIO_END_TOKEN_ID]
         latent_cap = int(request.max_new_tokens or MAX_DECODE_STEPS)
         updated[0].max_tokens = latent_cap + 1
+        if prompt is not None:
+            info = prompt.get("additional_information")
+            if isinstance(info, dict):
+                if request_id is not None:
+                    info[KEY_REQUEST_ID] = request_id
+                if request.seed is not None:
+                    info["tts_local_seed"] = int(request.seed)
         return updated
 
 

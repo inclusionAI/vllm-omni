@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import torch
 import torch.nn as nn
@@ -326,7 +326,14 @@ class AudioVAE(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
 
     @torch.inference_mode()
-    def encode_latent(self, waveform, waveform_length):
+    def encode_latent(
+        self,
+        waveform,
+        waveform_length,
+        *,
+        generator: torch.Generator | None = None,
+        posterior_parameterization: str = "softplus_scale",
+    ):
         if waveform.ndim != 2:
             raise ValueError(f"Expected waveform rank-2 [Batch, Time], got {tuple(waveform.shape)}")
         if waveform_length.ndim != 1:
@@ -346,9 +353,21 @@ class AudioVAE(PreTrainedModel):
         h, _ = self.encoder(waveform)
         h = h.transpose(1, 2)
 
-        mean, scale = torch.chunk(h, 2, dim=1)
-        std = F.softplus(scale) + 1e-4
-        latent = (mean + std * torch.randn_like(mean)).transpose(1, 2)
+        mean, posterior_parameter = torch.chunk(h, 2, dim=1)
+        if posterior_parameterization == "softplus_scale":
+            std = F.softplus(posterior_parameter) + 1e-4
+        elif posterior_parameterization == "clamped_logvar":
+            logvar = torch.clamp(posterior_parameter, -30.0, 20.0)
+            std = torch.exp(0.5 * logvar)
+        else:
+            raise ValueError(f"Unsupported AudioVAE posterior parameterization: {posterior_parameterization}")
+        noise = torch.randn(
+            mean.shape,
+            generator=generator,
+            device=mean.device,
+            dtype=mean.dtype,
+        )
+        latent = (mean + std * noise).transpose(1, 2)
         return latent, frame_num
 
     @torch.inference_mode()
