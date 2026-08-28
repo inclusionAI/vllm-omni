@@ -1024,6 +1024,13 @@ def test_lingv3_build_accepts_resolver_cache_key(mocker):
     assert prepared.model_type == "lingv3_tts"
 
 
+def test_lingv3_requires_reference_audio():
+    request = SimpleNamespace(input="hello", ref_audio=None)
+    adapter = LingV3TTSAdapter(SimpleNamespace(server=SimpleNamespace()))
+
+    assert adapter.validate(request) == "LingV3-TTS requires 'ref_audio'"
+
+
 def test_indextts_adapters_are_versioned():
     assert resolve_adapter("indextts2") is IndexTTS2Adapter
     assert resolve_adapter("indextts2_5") is IndexTTS25Adapter

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import pytest
 
@@ -24,6 +24,7 @@ from vllm_omni.model_executor.models.lingv3_tts.prompt_assembly import (
     ASSISTANT_PREFIX,
     TEXT_PREFIX,
     USER_PREFIX,
+    build_lingv3_prompt,
     build_lingv3_prompt_token_ids,
     validate_lingv3_tokenizer,
 )
@@ -117,6 +118,16 @@ def test_prompt_contract_speaker_only():
     assert ids == expected
     assert ids[speaker_position] == AUDIO_PATCH_TOKEN_ID
     assert prompt_position is None
+
+
+def test_prompt_contract_requires_reference_audio():
+    with pytest.raises(ValueError, match="requires reference audio"):
+        build_lingv3_prompt(
+            FakeTokenizer(),
+            target_text="target",
+            reference_waveform=None,
+            reference_sample_rate=24000,
+        )
 
 
 def test_prompt_contract_concatenates_reference_and_target_without_separator():
