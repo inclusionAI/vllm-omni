@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/fm/flowloss.py
 
 import torch
@@ -30,6 +30,8 @@ class FlowLoss(nn.Module):
         sigma=0.25,
         temperature=0,
         generator=None,
+        initial_noise=None,
+        solver_noise=None,
     ):
         # z: [Batch, Time=1, Dimension]
         # latent_history: [Batch, History_Time, Dimension]
@@ -44,14 +46,24 @@ class FlowLoss(nn.Module):
                 f"Batch mismatch across conditioning and latent_history: {z.shape[0]}, {latent_history.shape[0]}"
             )
         dtype = z.dtype
-        noise = torch.randn(
-            z.shape[0],
-            self.z_channels,
-            patch_size,
-            device=z.device,
-            dtype=torch.float32,
-            generator=generator,
-        )
+        if initial_noise is None:
+            noise = torch.randn(
+                z.shape[0],
+                self.z_channels,
+                patch_size,
+                device=z.device,
+                dtype=torch.float32,
+                generator=generator,
+            ).transpose(1, 2)
+        else:
+            noise = initial_noise
+            expected = (z.shape[0], patch_size, self.z_channels)
+            if tuple(noise.shape) != expected:
+                raise ValueError(f"Initial noise shape mismatch: got {tuple(noise.shape)}, expected {expected}")
+        if solver_noise is not None:
+            expected = (10, z.shape[0], patch_size, self.z_channels)
+            if tuple(solver_noise.shape) != expected:
+                raise ValueError(f"Solver noise shape mismatch: got {tuple(solver_noise.shape)}, expected {expected}")
 
         def fn(t, x):
             x = x.to(dtype)
@@ -78,10 +90,11 @@ class FlowLoss(nn.Module):
         return (
             Solver(
                 fn,
-                noise.transpose(1, 2),
+                noise,
                 sigma=sigma,
                 temperature=temperature,
                 generator=generator,
+                noise=solver_noise,
             )
             .integrate(t)[-1]
             .to(dtype)

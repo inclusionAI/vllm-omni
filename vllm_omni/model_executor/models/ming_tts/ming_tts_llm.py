@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/modeling_bailingmm.py
 from __future__ import annotations
 
@@ -68,6 +68,7 @@ class MingLLMModel(nn.Module):
     stop_reason_key = KEY_STOP_REASON
     stop_probability_key = "ming_stop_prob"
     stop_reason_codes = STOP_REASON_CODES
+    vectorize_cfm_decode = False
     # Drop the tensor on purpose, otherwise upstream vLLM would reject.
     # The vendor never reaches them either (audio_gate/image_gate never fire)
     # dropping them keeps routing identical to the reference implementation.
@@ -119,9 +120,9 @@ class MingLLMModel(nn.Module):
         self._last_ming_next_token_ids = None
         self._last_text_mode = False
         # CUDAGraph for the flow-matching (CFM) diffusion head — the TTFP/latency
-        # hot spot. Built lazily on the first batch=1 CUDA decode; set
+        # hot spot. Built lazily per CUDA batch size; set
         # MING_CFM_CUDAGRAPH=0 to force the eager flow head.
-        self._cfm_graph = None
+        self._cfm_graphs = {}
         self._cfm_graph_enabled = os.environ.get("MING_CFM_CUDAGRAPH", "1") == "1"
 
     def embed_input_ids(
@@ -192,6 +193,7 @@ class MingLLMModel(nn.Module):
         pending_updates: dict[str, dict[str, Any]] = {}
         cursor = 0
         any_decode = False
+        vectorized_results = self._vectorized_decode_results(hidden_states, request_infos, token_counts)
         for req_idx, token_count in enumerate(token_counts):
             end = min(cursor + token_count, total_tokens)
             if end <= cursor:
@@ -208,14 +210,17 @@ class MingLLMModel(nn.Module):
             decode_hidden, output_index = (
                 (hidden_states[cursor:end], cursor) if token_count == 1 else (hidden_states[end - 1 : end], end - 1)
             )
-            sampled_token_latent, next_embeds, new_history, stop_probs = self._decode_one_step(
-                hidden_states=decode_hidden,
-                latent_history=req_history,
-                cfg_scale=_resolve_runtime_float(req_info, KEY_CFG, self.ming_config.cfg),
-                sigma=_resolve_runtime_float(req_info, KEY_SIGMA, self.ming_config.sigma),
-                temperature=_resolve_runtime_float(req_info, KEY_TEMPERATURE, self.ming_config.temperature),
-                generator=self._get_request_generator(req_info, hidden_states.device),
-            )
+            decode_result = vectorized_results.get(req_idx)
+            if decode_result is None:
+                decode_result = self._decode_one_step(
+                    hidden_states=decode_hidden,
+                    latent_history=req_history,
+                    cfg_scale=_resolve_runtime_float(req_info, KEY_CFG, self.ming_config.cfg),
+                    sigma=_resolve_runtime_float(req_info, KEY_SIGMA, self.ming_config.sigma),
+                    temperature=_resolve_runtime_float(req_info, KEY_TEMPERATURE, self.ming_config.temperature),
+                    generator=self._get_request_generator(req_info, hidden_states.device),
+                )
+            sampled_token_latent, next_embeds, new_history, stop_probs = decode_result
             req_max_decode_steps = _resolve_runtime_int(
                 req_info, KEY_MAX_DECODE_STEPS, self.ming_config.max_decode_steps
             )
@@ -351,14 +356,130 @@ class MingLLMModel(nn.Module):
             logprobs_tensors=None,
         )
 
+    def _vectorized_decode_results(
+        self,
+        hidden_states: torch.Tensor,
+        request_infos: list[dict[str, Any]],
+        token_counts: list[int],
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """Batch compatible flow-head calls while preserving request RNGs."""
+        if not self.vectorize_cfm_decode or len(token_counts) < 2:
+            return {}
+
+        records = []
+        cursor = 0
+        total_tokens = hidden_states.shape[0]
+        for req_idx, token_count in enumerate(token_counts):
+            end = min(cursor + token_count, total_tokens)
+            if end <= cursor:
+                continue
+            req_info = request_infos[req_idx] if req_idx < len(request_infos) else {}
+            req_history = _coerce_latent_history(
+                req_info.get(KEY_LATENT_HISTORY),
+                device=hidden_states.device,
+                dtype=self.fm_dtype,
+                cfg=self.ming_config,
+            )
+            if req_history is not None:
+                decode_hidden = hidden_states[cursor:end] if token_count == 1 else hidden_states[end - 1 : end]
+                records.append(
+                    (
+                        req_idx,
+                        req_info,
+                        decode_hidden,
+                        req_history,
+                        _resolve_runtime_float(req_info, KEY_CFG, self.ming_config.cfg),
+                        _resolve_runtime_float(req_info, KEY_SIGMA, self.ming_config.sigma),
+                        _resolve_runtime_float(req_info, KEY_TEMPERATURE, self.ming_config.temperature),
+                    )
+                )
+            cursor = end
+
+        groups: dict[tuple[Any, ...], list[int]] = {}
+        for record_idx, record in enumerate(records):
+            _, _, decode_hidden, req_history, cfg_scale, sigma, temperature = record
+            key = (
+                cfg_scale,
+                sigma,
+                temperature,
+                tuple(decode_hidden.shape[1:]),
+                tuple(req_history.shape[1:]),
+                decode_hidden.dtype,
+                req_history.dtype,
+                decode_hidden.device,
+                req_history.device,
+            )
+            groups.setdefault(key, []).append(record_idx)
+
+        results = {}
+        for record_indices in groups.values():
+            if len(record_indices) < 2:
+                continue
+            selected = [records[index] for index in record_indices]
+            generators = [self._get_request_generator(record[1], hidden_states.device) for record in selected]
+            initial_noise, solver_noise = self._draw_request_cfm_noises(generators, hidden_states.device)
+            batch_result = self._decode_one_step(
+                hidden_states=torch.cat([record[2] for record in selected], dim=0),
+                latent_history=torch.cat([record[3] for record in selected], dim=0),
+                cfg_scale=selected[0][4],
+                sigma=selected[0][5],
+                temperature=selected[0][6],
+                initial_noise=initial_noise,
+                solver_noise=solver_noise,
+            )
+            for batch_idx, record in enumerate(selected):
+                results[record[0]] = tuple(tensor[batch_idx : batch_idx + 1] for tensor in batch_result)
+        return results
+
+    def _draw_request_cfm_noises(
+        self,
+        generators: list[torch.Generator | None],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        initial_noise = []
+        solver_noise = []
+        shape = (1, self.ming_config.patch_size, self.ming_config.latent_dim)
+        for generator in generators:
+            initial_noise.append(
+                torch.randn(
+                    (1, self.ming_config.latent_dim, self.ming_config.patch_size),
+                    device=device,
+                    dtype=torch.float32,
+                    generator=generator,
+                ).transpose(1, 2)
+            )
+            # Match the active batch-1 path's RNG call boundaries so a fixed
+            # request seed is stable when scheduler concurrency changes.
+            if self._cfm_graph_enabled:
+                request_solver_noise = torch.randn(
+                    (_CFM_STEPS, *shape),
+                    device=device,
+                    dtype=torch.float32,
+                    generator=generator,
+                )
+            else:
+                request_solver_noise = torch.stack(
+                    [
+                        torch.randn(
+                            shape,
+                            device=device,
+                            dtype=torch.float32,
+                            generator=generator,
+                        )
+                        for _ in range(_CFM_STEPS)
+                    ]
+                )
+            solver_noise.append(request_solver_noise)
+        return torch.cat(initial_noise, dim=0), torch.cat(solver_noise, dim=1)
+
     def _maybe_build_cfm_graph(self, z_diff_cond: torch.Tensor):
-        """Lazily build the CFM CUDAGraph executor (batch=1, CUDA only)."""
-        if not self._cfm_graph_enabled:
+        """Lazily build one CFM CUDAGraph executor per CUDA batch size."""
+        if not self._cfm_graph_enabled or not z_diff_cond.is_cuda:
             return None
-        if z_diff_cond.shape[0] != 1 or not z_diff_cond.is_cuda:
-            return None
-        if self._cfm_graph is not None:
-            return self._cfm_graph
+        batch_size = z_diff_cond.shape[0]
+        graph_exec = self._cfm_graphs.get(batch_size)
+        if graph_exec is not None:
+            return graph_exec
         try:
             # TODO(perf):
             #   (1) compile per-block (dit_model.blocks) instead of the
@@ -383,7 +504,7 @@ class MingLLMModel(nn.Module):
                     logger.warning("Ming CFM torch.compile failed (%s); using uncompiled DiT.", exc)
 
             sampler = CFMSampler(self.flowloss.cfm.model, steps=_CFM_STEPS)
-            self._cfm_graph = CFMGraphExecutor(
+            graph_exec = CFMGraphExecutor(
                 sampler,
                 self.linear_proj_audio,
                 self.stop_head,
@@ -391,12 +512,18 @@ class MingLLMModel(nn.Module):
                 latent_dim=self.ming_config.latent_dim,
                 steps=_CFM_STEPS,
             )
-            logger.info("Ming CFM CUDAGraph enabled (steps=%d, patch=%d).", _CFM_STEPS, self.ming_config.patch_size)
+            self._cfm_graphs[batch_size] = graph_exec
+            logger.info(
+                "Ming CFM CUDAGraph enabled (batch=%d, steps=%d, patch=%d).",
+                batch_size,
+                _CFM_STEPS,
+                self.ming_config.patch_size,
+            )
         except Exception as exc:
             logger.warning("Ming CFM CUDAGraph unavailable (%s); using eager flow head.", exc)
             self._cfm_graph_enabled = False
             return None
-        return self._cfm_graph
+        return graph_exec
 
     def _decode_one_step(
         self,
@@ -407,6 +534,8 @@ class MingLLMModel(nn.Module):
         sigma: float,
         temperature: float,
         generator: torch.Generator | None = None,
+        initial_noise: torch.Tensor | None = None,
+        solver_noise: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         if hidden_states.dim() != 2:
             raise RuntimeError(f"Expected decode hidden_states rank-2 [B,H], got {tuple(hidden_states.shape)}")
@@ -439,11 +568,13 @@ class MingLLMModel(nn.Module):
                     sigma,
                     temperature,
                     generator=generator,
+                    initial_noise=initial_noise,
+                    solver_noise=solver_noise,
                 )
                 stop_probs = stop_full[:, 1]
             except Exception as exc:
                 logger.warning("Ming CFM CUDAGraph failed (%s); falling back to eager flow head.", exc)
-                self._cfm_graph = None
+                self._cfm_graphs.clear()
                 self._cfm_graph_enabled = False
                 sampled_token_latent = next_embeds = stop_probs = None
 
@@ -456,6 +587,8 @@ class MingLLMModel(nn.Module):
                 sigma=sigma,
                 temperature=temperature,
                 generator=generator,
+                initial_noise=initial_noise,
+                solver_noise=solver_noise,
             )
             # Aggregator expects [Batch, Time, Dimension] = [B, 4, 64] and returns [B, 1, H].
             next_embeds = self.linear_proj_audio(sampled_token_latent)

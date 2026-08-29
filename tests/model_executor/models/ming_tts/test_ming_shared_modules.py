@@ -435,3 +435,19 @@ def test_ming_compute_logits_text_mode_delegates_to_backbone():
 
     assert torch.equal(model.model.hidden_states, hidden_states)
     assert torch.equal(logits, torch.ones((2, 3)))
+
+
+def test_cfm_solver_accepts_precomputed_per_step_noise():
+    y0 = torch.zeros((1, 1, 1))
+    timesteps = torch.tensor([0.0, 0.5, 1.0])
+    noise = torch.tensor([[[[2.0]]], [[[99.0]]]])
+
+    solution = Solver(
+        lambda _timestep, state: torch.zeros_like(state),
+        y0,
+        sigma=1.0,
+        temperature=1.0,
+        noise=noise,
+    ).integrate(timesteps)
+
+    assert torch.allclose(solution[-1], torch.full_like(y0, 2.0 * (0.5**0.5)))

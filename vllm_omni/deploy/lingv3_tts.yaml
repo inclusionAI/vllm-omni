@@ -15,7 +15,8 @@ connectors:
 
 stages:
   - stage_id: 0
-    max_num_seqs: 1
+    # For now, the CFM CUDA graph is captured lazily per batch size.
+    max_num_seqs: 4
     gpu_memory_utilization: 0.60
     enforce_eager: true
     enable_prefix_caching: false
@@ -33,7 +34,8 @@ stages:
       detokenize: true
 
   - stage_id: 1
-    max_num_seqs: 1
+    # AudioVAE KV, upsampler, and ISTFT state are keyed by request_id.
+    max_num_seqs: 4
     gpu_memory_utilization: 0.25
     enforce_eager: true
     enable_prefix_caching: false

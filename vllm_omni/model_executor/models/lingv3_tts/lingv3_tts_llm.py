@@ -69,6 +69,7 @@ class LingV3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
     stop_reason_key = KEY_STOP_REASON
     stop_probability_key = "lingv3_stop_prob"
     stop_reason_codes = STOP_REASON_CODES
+    vectorize_cfm_decode = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
@@ -104,7 +105,7 @@ class LingV3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
         self._pending_postprocess_updates: dict[str, dict[str, Any]] = {}
         self._last_ming_next_token_ids = None
         self._last_text_mode = False
-        self._cfm_graph = None
+        self._cfm_graphs = {}
         self._cfm_graph_enabled = os.environ.get("LINGV3_CFM_CUDAGRAPH", "1") == "1"
         print(f" >>> self._cfm_graph_enabled: {self._cfm_graph_enabled}")
         self._request_generators: dict[str, torch.Generator] = {}
