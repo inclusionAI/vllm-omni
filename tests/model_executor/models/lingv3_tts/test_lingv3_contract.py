@@ -1,14 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
-import yaml
 
+from vllm_omni.model_executor.models.common.ming.cfm_cudagraph import CFMGraphExecutor
 from vllm_omni.model_executor.models.common.ming.continuous_tts import (
     STOP_REASON_CONTINUE,
     STOP_REASON_MAX_DECODE_STEPS,
@@ -277,11 +276,22 @@ def test_pipeline_contract():
     assert stage1.final_output_type == "audio"
 
 
-def test_deploy_enables_bounded_multi_request_scheduling():
-    deploy_path = Path(__file__).parents[4] / "vllm_omni" / "deploy" / "lingv3_tts.yaml"
-    deploy = yaml.safe_load(deploy_path.read_text(encoding="utf-8"))
+def test_cfm_graph_bucket_zero_pads_without_touching_live_rows():
+    executor = SimpleNamespace(batch_size=4)
+    live = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    solver_noise = live.unsqueeze(0).expand(10, -1, -1)
 
-    assert [stage["max_num_seqs"] for stage in deploy["stages"]] == [4, 4]
+    model = SimpleNamespace(_cfm_graph_batch_sizes=[1, 2, 4])
+    assert LingV3TTSLLMModel._select_cfm_graph_batch_size(model, 3) == 4
+    padded = CFMGraphExecutor._pad_batch(executor, live)
+    padded_solver_noise = CFMGraphExecutor._pad_batch(executor, solver_noise, dim=1)
+
+    assert padded.shape == (4, 2)
+    assert padded_solver_noise.shape == (10, 4, 2)
+    torch.testing.assert_close(padded[:3], live)
+    torch.testing.assert_close(padded_solver_noise[:, :3], solver_noise)
+    assert torch.count_nonzero(padded[3]) == 0
+    assert torch.count_nonzero(padded_solver_noise[:, 3]) == 0
 
 
 def test_lingv3_vectorizes_only_compatible_flow_requests():

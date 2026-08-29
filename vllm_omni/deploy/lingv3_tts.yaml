@@ -15,12 +15,15 @@ connectors:
 
 stages:
   - stage_id: 0
-    # For now, the CFM CUDA graph is captured lazily per batch size.
-    max_num_seqs: 4
+    max_num_seqs: 16
     gpu_memory_utilization: 0.60
-    enforce_eager: true
+    enforce_eager: false
     enable_prefix_caching: false
     async_scheduling: false
+    compilation_config:
+      cudagraph_mode: PIECEWISE
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16]
+      cudagraph_num_of_warmups: 1
     max_num_batched_tokens: 8192
     max_model_len: 8192
     devices: "0"
@@ -35,7 +38,7 @@ stages:
 
   - stage_id: 1
     # AudioVAE KV, upsampler, and ISTFT state are keyed by request_id.
-    max_num_seqs: 4
+    max_num_seqs: 16
     gpu_memory_utilization: 0.25
     enforce_eager: true
     enable_prefix_caching: false
