@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from collections import defaultdict
 from types import SimpleNamespace
@@ -16,9 +16,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.tts]
 
 
 class _Request:
-    external_req_id = "req-1"
-
-    def __init__(self):
+    def __init__(self, request_id: str = "req-1"):
+        self.external_req_id = request_id
         self.finished = False
 
     def is_finished(self):
@@ -69,6 +68,23 @@ def test_async_transport_emits_initial_regular_and_final_chunks_once():
     assert final.latent.shape == (1, 1, 64)
     assert bool(final.meta.finished)
     assert llm2audio_vae_async_chunk(manager, None, request) is None
+
+
+def test_async_transport_keeps_interleaved_requests_isolated():
+    manager = _manager()
+    request_a = _Request("req-a")
+    request_b = _Request("req-b")
+
+    assert llm2audio_vae_async_chunk(manager, _step(1), request_a) is None
+    assert llm2audio_vae_async_chunk(manager, _step(10), request_b) is None
+
+    chunk_a = llm2audio_vae_async_chunk(manager, _step(2), request_a)
+    chunk_b = llm2audio_vae_async_chunk(manager, _step(20), request_b)
+
+    assert torch.equal(chunk_a.latent[:, 0, 0], torch.tensor([1.0, 2.0]))
+    assert torch.equal(chunk_b.latent[:, 0, 0], torch.tensor([10.0, 20.0]))
+    assert chunk_a.kv_metadata["ming_request_id"] == "req-a"
+    assert chunk_b.kv_metadata["ming_request_id"] == "req-b"
 
 
 def test_sync_transport_preserves_all_accumulated_latents():

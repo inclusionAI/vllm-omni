@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """CUDAGraph-accelerated CFM (flow-matching) diffusion head for Ming-TTS.
 
 The per-AR-step flow head runs ``steps`` ODE iterations, each a tiny DiT forward
@@ -8,8 +8,7 @@ micro kernels per step and the wall time is dominated by kernel-launch / Python
 overhead, not GPU math. Capturing the whole sampling loop + Aggregator + stop
 head into one CUDA graph removes that overhead.
 
-Adapted from adaspeech/ming_flash ``CFMGraphExecutor``. Captured for batch=1
-(Ming Stage-0 runs ``max_num_seqs: 1``); other batch sizes fall back to eager.
+Each executor is captured for one batch shape and cached by the Stage-0 model.
 """
 
 from __future__ import annotations
@@ -89,22 +88,40 @@ class CFMGraphExecutor:
         return build_timesteps(self.steps, device=device, dtype=torch.float32, use_epss=True, sway_sampling_coef=-1.0)
 
     @torch.no_grad()
-    def execute(self, llm_cond, his_lat, cfg_strength, sigma, temperature, generator=None):
+    def execute(
+        self,
+        llm_cond,
+        his_lat,
+        cfg_strength,
+        sigma,
+        temperature,
+        generator=None,
+        initial_noise=None,
+        solver_noise=None,
+    ):
         bsz = llm_cond.shape[0]
         device = llm_cond.device
         # ODE state / noise / timesteps are float32 to match the eager path.
-        y0 = torch.randn(
-            (bsz, self.patch_size, self.latent_dim),
-            device=device,
-            dtype=torch.float32,
-            generator=generator,
+        y0 = (
+            initial_noise
+            if initial_noise is not None
+            else torch.randn(
+                (bsz, self.patch_size, self.latent_dim),
+                device=device,
+                dtype=torch.float32,
+                generator=generator,
+            )
         )
         t = self._timesteps(device)
-        sde_rnd = torch.randn(
-            (self.steps, bsz, self.patch_size, self.latent_dim),
-            device=device,
-            dtype=torch.float32,
-            generator=generator,
+        sde_rnd = (
+            solver_noise
+            if solver_noise is not None
+            else torch.randn(
+                (self.steps, bsz, self.patch_size, self.latent_dim),
+                device=device,
+                dtype=torch.float32,
+                generator=generator,
+            )
         )
 
         if not self.initialized:

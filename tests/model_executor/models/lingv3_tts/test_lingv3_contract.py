@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
+import yaml
 
 from vllm_omni.model_executor.models.common.ming.continuous_tts import (
     STOP_REASON_CONTINUE,
@@ -273,3 +275,69 @@ def test_pipeline_contract():
     assert stage0.sampling_constraints["max_tokens"] == 801
     assert stage1.final_output is True
     assert stage1.final_output_type == "audio"
+
+
+def test_deploy_enables_bounded_multi_request_scheduling():
+    deploy_path = Path(__file__).parents[4] / "vllm_omni" / "deploy" / "lingv3_tts.yaml"
+    deploy = yaml.safe_load(deploy_path.read_text(encoding="utf-8"))
+
+    assert [stage["max_num_seqs"] for stage in deploy["stages"]] == [4, 4]
+
+
+def test_lingv3_vectorizes_only_compatible_flow_requests():
+    config = SimpleNamespace(
+        history_patch_size=2,
+        latent_dim=3,
+        patch_size=1,
+        llm_hidden_size=4,
+        cfg=2.0,
+        sigma=0.25,
+        temperature=0.0,
+    )
+    calls = []
+
+    def get_request_generator(info, device):
+        return torch.Generator(device=device).manual_seed(info["seed"])
+
+    def decode_one_step(**kwargs):
+        calls.append(kwargs)
+        batch_size = kwargs["hidden_states"].shape[0]
+        sampled = kwargs["initial_noise"].clone()
+        next_embeds = torch.zeros((batch_size, 1, config.llm_hidden_size))
+        history = torch.cat([kwargs["latent_history"][:, config.patch_size :], sampled], dim=1)
+        stop_probs = torch.zeros(batch_size)
+        return sampled, next_embeds, history, stop_probs
+
+    model = SimpleNamespace(
+        vectorize_cfm_decode=True,
+        _cfm_graph_enabled=True,
+        fm_dtype=torch.float32,
+        ming_config=config,
+        _get_request_generator=get_request_generator,
+        _decode_one_step=decode_one_step,
+    )
+    model._draw_request_cfm_noises = lambda generators, device: (
+        LingV3TTSLLMModel._draw_request_cfm_noises(model, generators, device)
+    )
+    history = torch.zeros((1, config.history_patch_size, config.latent_dim))
+    request_infos = [
+        {"ming_latent_history": history, "ming_cfg": 2.0, "seed": 11},
+        {"ming_latent_history": history, "ming_cfg": 2.0, "seed": 22},
+        {"ming_latent_history": history, "ming_cfg": 3.0, "seed": 33},
+    ]
+
+    results = LingV3TTSLLMModel._vectorized_decode_results(
+        model,
+        torch.arange(12, dtype=torch.float32).reshape(3, 4),
+        request_infos,
+        [1, 1, 1],
+    )
+
+    assert set(results) == {0, 1}
+    assert len(calls) == 1
+    assert calls[0]["hidden_states"].shape == (2, 4)
+    assert calls[0]["latent_history"].shape == (2, 2, 3)
+    assert calls[0]["initial_noise"].shape == (2, 1, 3)
+    assert calls[0]["solver_noise"].shape == (10, 2, 1, 3)
+    assert calls[0]["cfg_scale"] == 2.0
+    assert not torch.equal(calls[0]["initial_noise"][0], calls[0]["initial_noise"][1])
