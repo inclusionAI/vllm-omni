@@ -35,22 +35,23 @@ class LingV3TTSAdapter(ARTTSAdapter):
     max_new_tokens_max = MAX_DECODE_STEPS
 
     def validate(self, request: OpenAICreateSpeechRequest) -> str | None:
+        server = self.ctx.server
+        error = server._apply_uploaded_speaker(request)
+        if error:
+            return error
         if not request.input or not request.input.strip():
             return "Input text cannot be empty"
         if request.ref_audio is None:
-            return "LingV3-TTS requires 'ref_audio'"
+            return "LingV3-TTS requires 'ref_audio' or an uploaded audio voice"
         if isinstance(request.ref_audio, list):
             return "LingV3-TTS v1 accepts exactly one 'ref_audio' clip"
-        format_error = self.ctx.server._validate_ref_audio_format(request.ref_audio)
+        format_error = server._validate_ref_audio_format(request.ref_audio)
         if format_error:
             return format_error
         if request.ref_text is not None and not request.ref_text.strip():
             return "'ref_text' must be non-empty when provided"
         if request.instructions:
             return "LingV3-TTS v1 does not support 'instructions'"
-        voice = request.voice.lower() if isinstance(request.voice, str) else None
-        if voice and voice in getattr(self.ctx.server, "uploaded_speakers", {}):
-            return "LingV3-TTS v1 does not support stored voice presets"
         if request.speaker_embedding is not None:
             return "LingV3-TTS v1 derives speaker conditioning from 'ref_audio'"
         if request.max_new_tokens is not None:

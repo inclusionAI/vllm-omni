@@ -1041,9 +1041,36 @@ def test_lingv3_sampling_overrides_attach_request_rng_state():
 
 def test_lingv3_requires_reference_audio():
     request = SimpleNamespace(input="hello", ref_audio=None)
-    adapter = LingV3TTSAdapter(SimpleNamespace(server=SimpleNamespace()))
+    server = SimpleNamespace(_apply_uploaded_speaker=lambda request: None)
+    adapter = LingV3TTSAdapter(SimpleNamespace(server=server))
 
-    assert adapter.validate(request) == "LingV3-TTS requires 'ref_audio'"
+    assert adapter.validate(request) == "LingV3-TTS requires 'ref_audio' or an uploaded audio voice"
+
+
+def test_lingv3_accepts_audio_backed_uploaded_voice(mocker):
+    def resolve_uploaded_voice(request):
+        request.ref_audio = "data:audio/wav;base64,AA=="
+        request.ref_text = "Reference transcript."
+        return None
+
+    server = SimpleNamespace(
+        _apply_uploaded_speaker=mocker.Mock(side_effect=resolve_uploaded_voice),
+        _validate_ref_audio_format=lambda ref_audio: None,
+    )
+    request = SimpleNamespace(
+        input="hello",
+        voice="alice",
+        ref_audio=None,
+        ref_text=None,
+        instructions=None,
+        speaker_embedding=None,
+        max_new_tokens=None,
+    )
+
+    assert LingV3TTSAdapter(SimpleNamespace(server=server)).validate(request) is None
+    server._apply_uploaded_speaker.assert_called_once_with(request)
+    assert request.ref_audio == "data:audio/wav;base64,AA=="
+    assert request.ref_text == "Reference transcript."
 
 
 def test_indextts_adapters_are_versioned():
