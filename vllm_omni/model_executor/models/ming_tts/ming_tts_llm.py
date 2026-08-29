@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Iterable
 from typing import Any
 
@@ -26,6 +27,7 @@ from vllm_omni.model_executor.models.common.ming.cfm_cudagraph import (
 from vllm_omni.model_executor.models.common.ming.cfm_head import FlowLoss
 from vllm_omni.model_executor.models.common.ming.continuous_tts import STOP_REASON_CODES
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.platforms import current_omni_platform
 
 from .config_ming_tts import (
     KEY_CFG,
@@ -120,10 +122,8 @@ class MingLLMModel(nn.Module):
         self._last_ming_next_token_ids = None
         self._last_text_mode = False
         # CUDAGraph for the flow-matching (CFM) diffusion head — the TTFP/latency
-        # hot spot. Built lazily per CUDA batch size; set
-        # MING_CFM_CUDAGRAPH=0 to force the eager flow head.
-        self._cfm_graphs = {}
-        self._cfm_graph_enabled = os.environ.get("MING_CFM_CUDAGRAPH", "1") == "1"
+        # hot spot. Set MING_CFM_CUDAGRAPH=0 to force the eager flow head.
+        self._init_cfm_graph_state("MING_CFM_CUDAGRAPH")
 
     def embed_input_ids(
         self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor | None = None, **_: Any
@@ -356,6 +356,107 @@ class MingLLMModel(nn.Module):
             logprobs_tensors=None,
         )
 
+    def _init_cfm_graph_state(self, env_var: str) -> None:
+        self._cfm_graph_enabled = os.environ.get(env_var, "1") == "1"
+        self._cfm_graphs: dict[int, CFMGraphExecutor] = {}
+        self._cfm_graph_failed_batch_sizes: set[int] = set()
+        self._cfm_graph_warmed_up = False
+
+        compilation_config = getattr(self.vllm_config, "compilation_config", None)
+        raw_sizes = getattr(compilation_config, "cudagraph_capture_sizes", None) or [1]
+        scheduler_config = getattr(self.vllm_config, "scheduler_config", None)
+        max_num_seqs = max(1, int(getattr(scheduler_config, "max_num_seqs", 1)))
+        self._cfm_graph_batch_sizes = sorted({int(size) for size in raw_sizes if 0 < int(size) <= max_num_seqs})
+        self._cfm_graph_num_warmups = max(
+            1,
+            int(getattr(compilation_config, "cudagraph_num_of_warmups", 1)),
+        )
+
+    def _select_cfm_graph_batch_size(self, actual_batch_size: int) -> int | None:
+        return next((size for size in self._cfm_graph_batch_sizes if size >= actual_batch_size), None)
+
+    @torch.no_grad()
+    def _warmup_cfm_graphs(self) -> None:
+        if self._cfm_graph_warmed_up or not self._cfm_graph_enabled:
+            return
+        device = next(self.flowloss.parameters()).device
+        if device.type != "cuda" or not self._cfm_graph_batch_sizes:
+            return
+        self._cfm_graph_warmed_up = True
+        self.flowloss.eval()
+        self.linear_proj_audio.eval()
+        self.stop_head.eval()
+
+        logger.info(
+            "Ming CFM CUDA Graph warmup: batch_sizes=%s warmups=%d",
+            self._cfm_graph_batch_sizes,
+            self._cfm_graph_num_warmups,
+        )
+        start_s = time.perf_counter()
+        with current_omni_platform.device(device):
+            for batch_size in reversed(self._cfm_graph_batch_sizes):
+                if batch_size in self._cfm_graph_failed_batch_sizes:
+                    continue
+                try:
+                    hidden_states = torch.zeros(
+                        (batch_size, self.ming_config.llm_hidden_size),
+                        device=device,
+                        dtype=self.fm_dtype,
+                    )
+                    latent_history = torch.zeros(
+                        (
+                            batch_size,
+                            self.ming_config.history_patch_size,
+                            self.ming_config.latent_dim,
+                        ),
+                        device=device,
+                        dtype=self.fm_dtype,
+                    )
+                    initial_noise = torch.zeros(
+                        (
+                            batch_size,
+                            self.ming_config.patch_size,
+                            self.ming_config.latent_dim,
+                        ),
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    solver_noise = torch.zeros(
+                        (
+                            _CFM_STEPS,
+                            batch_size,
+                            self.ming_config.patch_size,
+                            self.ming_config.latent_dim,
+                        ),
+                        device=device,
+                        dtype=torch.float32,
+                    )
+                    self._decode_one_step(
+                        hidden_states=hidden_states,
+                        latent_history=latent_history,
+                        cfg_scale=float(self.ming_config.cfg),
+                        sigma=float(self.ming_config.sigma),
+                        temperature=float(self.ming_config.temperature),
+                        initial_noise=initial_noise,
+                        solver_noise=solver_noise,
+                    )
+                except Exception:
+                    self._cfm_graphs.pop(batch_size, None)
+                    self._cfm_graph_failed_batch_sizes.add(batch_size)
+                    logger.warning(
+                        "Ming CFM CUDA Graph warmup failed for batch=%d; using eager for this shape.",
+                        batch_size,
+                        exc_info=True,
+                    )
+        torch.accelerator.synchronize(device)
+        captured = sorted(batch_size for batch_size, graph_exec in self._cfm_graphs.items() if graph_exec.initialized)
+        logger.info(
+            "Ming CFM CUDA Graph warmup complete: captured=%s failed=%s in %.1f ms",
+            captured,
+            sorted(self._cfm_graph_failed_batch_sizes),
+            (time.perf_counter() - start_s) * 1000.0,
+        )
+
     def _vectorized_decode_results(
         self,
         hidden_states: torch.Tensor,
@@ -473,22 +574,22 @@ class MingLLMModel(nn.Module):
         return torch.cat(initial_noise, dim=0), torch.cat(solver_noise, dim=1)
 
     def _maybe_build_cfm_graph(self, z_diff_cond: torch.Tensor):
-        """Lazily build one CFM CUDAGraph executor per CUDA batch size."""
-        if not self._cfm_graph_enabled or not z_diff_cond.is_cuda:
+        """Return the smallest configured graph bucket for this CUDA batch."""
+        if not self._cfm_graph_enabled or not z_diff_cond.is_cuda or torch.cuda.is_current_stream_capturing():
             return None
-        batch_size = z_diff_cond.shape[0]
+        actual_batch_size = int(z_diff_cond.shape[0])
+        batch_size = self._select_cfm_graph_batch_size(actual_batch_size)
+        if batch_size is None or batch_size in self._cfm_graph_failed_batch_sizes:
+            return None
         graph_exec = self._cfm_graphs.get(batch_size)
         if graph_exec is not None:
             return graph_exec
         try:
-            # TODO(perf):
-            #   (1) compile per-block (dit_model.blocks) instead of the
-            #   whole forward for tighter fusion / fewer graph breaks;
-            #   (2) move the compile + a synthetic warmup forward to a post-weight-load hook
+            # TODO(perf): move the compile into a vLLM support_torch_compile
+            # adapter once the shared Ming CFM modules are migrated.
             dit_model = self.flowloss.cfm.model
             if not getattr(dit_model, "_ming_compiled", False):
                 try:
-                    # Scoped options (avoid mutating global inductor config).
                     dit_model.forward = torch.compile(
                         dit_model.forward,
                         fullgraph=False,
@@ -503,25 +604,25 @@ class MingLLMModel(nn.Module):
                 except Exception as exc:
                     logger.warning("Ming CFM torch.compile failed (%s); using uncompiled DiT.", exc)
 
-            sampler = CFMSampler(self.flowloss.cfm.model, steps=_CFM_STEPS)
             graph_exec = CFMGraphExecutor(
-                sampler,
+                CFMSampler(self.flowloss.cfm.model, steps=_CFM_STEPS),
                 self.linear_proj_audio,
                 self.stop_head,
                 patch_size=self.ming_config.patch_size,
                 latent_dim=self.ming_config.latent_dim,
+                batch_size=batch_size,
                 steps=_CFM_STEPS,
+                num_warmups=self._cfm_graph_num_warmups,
             )
             self._cfm_graphs[batch_size] = graph_exec
-            logger.info(
-                "Ming CFM CUDAGraph enabled (batch=%d, steps=%d, patch=%d).",
+        except Exception:
+            self._cfm_graphs.pop(batch_size, None)
+            self._cfm_graph_failed_batch_sizes.add(batch_size)
+            logger.warning(
+                "Ming CFM CUDA Graph setup failed for batch=%d; using eager for this shape.",
                 batch_size,
-                _CFM_STEPS,
-                self.ming_config.patch_size,
+                exc_info=True,
             )
-        except Exception as exc:
-            logger.warning("Ming CFM CUDAGraph unavailable (%s); using eager flow head.", exc)
-            self._cfm_graph_enabled = False
             return None
         return graph_exec
 
@@ -553,7 +654,7 @@ class MingLLMModel(nn.Module):
             raise RuntimeError("Non-finite z_diff_cond before FlowLoss.sample().")
 
         # Fast path: CUDAGraph-captured flow head (CFM sampling + Aggregator +
-        # stop head). Falls back permanently to the eager path on any failure.
+        # stop head). A failed batch shape falls back to eager independently.
         sampled_token_latent = next_embeds = stop_probs = None
         # cfg < 1e-5 disables CFG; the eager flow head handles this with a
         # dedicated unconditional branch (c=zeros) that the captured graph does
@@ -561,7 +662,7 @@ class MingLLMModel(nn.Module):
         graph_exec = self._maybe_build_cfm_graph(z_diff_cond) if cfg_scale >= 1e-5 else None
         if graph_exec is not None:
             try:
-                sampled_token_latent, next_embeds, stop_full = graph_exec.execute(
+                graph_result = graph_exec.execute(
                     z_diff_cond,
                     latent_history,
                     cfg_scale,
@@ -571,11 +672,18 @@ class MingLLMModel(nn.Module):
                     initial_noise=initial_noise,
                     solver_noise=solver_noise,
                 )
-                stop_probs = stop_full[:, 1]
-            except Exception as exc:
-                logger.warning("Ming CFM CUDAGraph failed (%s); falling back to eager flow head.", exc)
-                self._cfm_graphs.clear()
-                self._cfm_graph_enabled = False
+                if graph_result is not None:
+                    sampled_token_latent, next_embeds, stop_full = graph_result
+                    stop_probs = stop_full[:, 1]
+            except Exception:
+                batch_size = graph_exec.batch_size
+                self._cfm_graphs.pop(batch_size, None)
+                self._cfm_graph_failed_batch_sizes.add(batch_size)
+                logger.warning(
+                    "Ming CFM CUDA Graph failed for batch=%d; using eager for this shape.",
+                    batch_size,
+                    exc_info=True,
+                )
                 sampled_token_latent = next_embeds = stop_probs = None
 
         if sampled_token_latent is None:

@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterable
 from typing import Any
 
@@ -105,9 +104,7 @@ class LingV3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
         self._pending_postprocess_updates: dict[str, dict[str, Any]] = {}
         self._last_ming_next_token_ids = None
         self._last_text_mode = False
-        self._cfm_graphs = {}
-        self._cfm_graph_enabled = os.environ.get("LINGV3_CFM_CUDAGRAPH", "1") == "1"
-        print(f" >>> self._cfm_graph_enabled: {self._cfm_graph_enabled}")
+        self._init_cfm_graph_state("LINGV3_CFM_CUDAGRAPH")
         self._request_generators: dict[str, torch.Generator] = {}
 
     def make_empty_intermediate_tensors(self, *args: Any, **kwargs: Any):
@@ -220,6 +217,7 @@ class LingV3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
                 loaded_tts,
                 prefix=f"{module_name}.",
             )
+        self._warmup_cfm_graphs()
         return {f"model.{name}" for name in loaded_backbone} | loaded_tts
 
 
