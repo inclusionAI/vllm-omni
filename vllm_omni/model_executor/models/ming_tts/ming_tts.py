@@ -51,6 +51,8 @@ class _ModelSampleAdapter(nn.Module):
 
 
 class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin):
+    requires_request_sample_eligibility = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         del prefix
