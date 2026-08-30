@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Checkpoint and runtime configuration for inclusionAI LingV3-TTS."""
 
 from __future__ import annotations
@@ -60,6 +60,9 @@ class BailingMoeV3Config(PretrainedConfig):
 
     def __init__(self, **kwargs: Any) -> None:
         checkpoint_model_type = kwargs.pop("model_type", "bailing_moe_v3")
+        # NOTE: disable bounded safe gate for now, for parity
+        kwargs["kda_safe_gate"] = False
+        kwargs["kda_lower_bound"] = None
         super().__init__(**kwargs)
         self.checkpoint_model_type = checkpoint_model_type
 

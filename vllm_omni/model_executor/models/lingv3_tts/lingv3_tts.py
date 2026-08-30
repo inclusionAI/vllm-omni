@@ -191,7 +191,7 @@ class LingV3TTSForConditionalGeneration(
         ).squeeze(0)
 
         if prompt_latents is not None:
-            patches = prompt_latents["patches"].to(dtype=self.model.fm_dtype)
+            patches = prompt_latents["patches"].to(device=input_embeds.device, dtype=self.model.fm_dtype)
             prompt_embeds = self.model.linear_proj_audio(patches).squeeze(1)
             positions = _find_audio_placeholder_positions(input_ids, self.ming_config)
             if positions.numel() != prompt_embeds.shape[0]:
