@@ -80,7 +80,7 @@ def _load_prompt_encoder(wrapper: Any) -> AudioVAE:
             raise RuntimeError("Ming Stage-0 requires audio_tokenizer_config to encode prompt audio.")
 
         load_start = time.perf_counter()
-        encoder = AudioVAE(wrapper.ming_config.audio_tokenizer_config).eval()
+        encoder = AudioVAE(wrapper.ming_config.audio_tokenizer_config, build_decoder=False).eval()
         state_dict = encoder.state_dict()
         loaded = 0
         loaded_encoder_params = set()
@@ -111,8 +111,6 @@ def _load_prompt_encoder(wrapper: Any) -> AudioVAE:
 
         dev = next(wrapper.parameters()).device
         try:
-            del encoder.decoder
-            encoder.decoder = None
             if dev.type != "cpu":
                 encoder.encoder.to(dev, dtype=getattr(wrapper.model, "fm_dtype", torch.bfloat16))
             else:

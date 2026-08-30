@@ -132,7 +132,7 @@ class LingV3TTSForConditionalGeneration(
         allowed = (
             ("model.", "linear_proj_audio.", "flowloss.", "stop_head.", "spk_head.")
             if self.model_stage == "llm"
-            else ("audio.",)
+            else ("audio.decoder.",)
         )
         selected = [(name, value) for name, value in weights if name.startswith(allowed)]
         if not selected:
