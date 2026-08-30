@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/audio_tokenizer/modeling_audio_vae.py
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ class MingAudioVAEModel(nn.Module):
             raise ValueError("MingAudioVAEModel requires audio_tokenizer_config")
         self.ming_config.validate()
 
-        self.audio = AudioVAE(self.ming_config.audio_tokenizer_config)
+        self.audio = AudioVAE(self.ming_config.audio_tokenizer_config, build_encoder=False)
         self.have_multimodal_outputs = True
         self.has_preprocess = False
         self.has_postprocess = False

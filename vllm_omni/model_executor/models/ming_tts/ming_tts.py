@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -114,9 +114,9 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
             loaded = self.model.load_weights(llm_weights)
             return {f"model.{name}" for name in loaded}
 
-        audio_weights = [(k, v) for k, v in weights if k.startswith("audio.")]
+        audio_weights = [(k, v) for k, v in weights if k.startswith("audio.decoder.")]
         if not audio_weights:
-            raise RuntimeError("Ming Stage-1 received no loadable checkpoint weights. Expected prefix: audio.*")
+            raise RuntimeError("Ming Stage-1 received no loadable checkpoint weights. Expected prefix: audio.decoder.*")
         loaded = self.model.load_weights(audio_weights)
         return {f"model.{name}" for name in loaded}
 
@@ -166,7 +166,7 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
                 return input_ids[:-1], input_embeds[:-1], update
             return input_ids, input_embeds, update
 
-        update: dict[str, Any] = {KEY_DECODE_STEP: int(info_dict.get(KEY_DECODE_STEP, 0))}
+        update = {KEY_DECODE_STEP: int(info_dict.get(KEY_DECODE_STEP, 0))}
         prompt_latents = _resolve_prompt_latents(self, info_dict)
         history = _initial_history(
             prompt_latents["frames"] if prompt_latents is not None else None,
@@ -213,7 +213,7 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
                 update[KEY_REQUEST_ID] = request_id
             return input_ids, input_embeds, update
 
-        update: dict[str, Any] = {KEY_DECODE_STEP: int(info_dict.get(KEY_DECODE_STEP, 0))}
+        update = {KEY_DECODE_STEP: int(info_dict.get(KEY_DECODE_STEP, 0))}
         history = info_dict.get(KEY_LATENT_HISTORY)
         if isinstance(history, torch.Tensor):
             update[KEY_LATENT_HISTORY] = history.detach().to("cpu").contiguous()

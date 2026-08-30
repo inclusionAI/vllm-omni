@@ -278,38 +278,53 @@ class Decoder(nn.Module):
 class AudioVAE(PreTrainedModel):
     config_class = AudioVAEConfig
 
-    def __init__(self, config):
+    def __init__(
+        self,
+        config,
+        *,
+        build_encoder: bool = True,
+        build_decoder: bool = True,
+    ):
         super().__init__(config)
+        if not build_encoder and not build_decoder:
+            raise ValueError("AudioVAE requires at least one of encoder or decoder.")
+
         self.config = config
+        self.encoder = None
+        self.decoder = None
         enc_kwargs = config.enc_kwargs
         dec_kwargs = config.dec_kwargs
-        for key in ("backbone", "input_dim", "latent_dim"):
-            if key not in enc_kwargs:
-                raise ValueError(f"AudioVAE.enc_kwargs missing required key: {key}")
-        for key in ("backbone", "output_dim", "latent_dim"):
-            if key not in dec_kwargs:
-                raise ValueError(f"AudioVAE.dec_kwargs missing required key: {key}")
+        if build_encoder:
+            for key in ("backbone", "input_dim", "latent_dim"):
+                if key not in enc_kwargs:
+                    raise ValueError(f"AudioVAE.enc_kwargs missing required key: {key}")
+        if build_decoder:
+            for key in ("backbone", "output_dim", "latent_dim"):
+                if key not in dec_kwargs:
+                    raise ValueError(f"AudioVAE.dec_kwargs missing required key: {key}")
 
-        hop_size = enc_kwargs.get("hop_size", enc_kwargs["input_dim"])
-        if enc_kwargs["input_dim"] != hop_size:
-            raise ValueError(f"AudioVAE encoder input_dim ({enc_kwargs['input_dim']}) != hop_size ({hop_size}).")
-        if hop_size != dec_kwargs["output_dim"]:
-            raise ValueError(
-                f"AudioVAE encoder hop_size ({hop_size}) != decoder output_dim ({dec_kwargs['output_dim']})."
+        if build_encoder:
+            hop_size = enc_kwargs.get("hop_size", enc_kwargs["input_dim"])
+            if enc_kwargs["input_dim"] != hop_size:
+                raise ValueError(f"AudioVAE encoder input_dim ({enc_kwargs['input_dim']}) != hop_size ({hop_size}).")
+            if build_decoder and hop_size != dec_kwargs["output_dim"]:
+                raise ValueError(
+                    f"AudioVAE encoder hop_size ({hop_size}) != decoder output_dim ({dec_kwargs['output_dim']})."
+                )
+            self.encoder = Encoder(
+                encoder_args=enc_kwargs["backbone"],
+                input_dim=enc_kwargs["input_dim"],
+                hop_size=hop_size,
+                latent_dim=enc_kwargs["latent_dim"],
+                patch_size=config.patch_size,
             )
-        self.encoder = Encoder(
-            encoder_args=enc_kwargs["backbone"],
-            input_dim=enc_kwargs["input_dim"],
-            hop_size=hop_size,
-            latent_dim=enc_kwargs["latent_dim"],
-            patch_size=config.patch_size,
-        )
-        self.decoder = Decoder(
-            decoder_args=dec_kwargs["backbone"],
-            output_dim=dec_kwargs["output_dim"],
-            latent_dim=dec_kwargs["latent_dim"],
-            patch_size=config.patch_size,
-        )
+        if build_decoder:
+            self.decoder = Decoder(
+                decoder_args=dec_kwargs["backbone"],
+                output_dim=dec_kwargs["output_dim"],
+                latent_dim=dec_kwargs["latent_dim"],
+                patch_size=config.patch_size,
+            )
         self.post_init()
 
     def _init_weights(self, module):
@@ -335,6 +350,8 @@ class AudioVAE(PreTrainedModel):
         generator: torch.Generator | None = None,
         posterior_parameterization: str = "softplus_scale",
     ):
+        if self.encoder is None:
+            raise RuntimeError("AudioVAE encoder is unavailable in decoder-only mode.")
         if waveform.ndim != 2:
             raise ValueError(f"Expected waveform rank-2 [Batch, Time], got {tuple(waveform.shape)}")
         if waveform_length.ndim != 1:
@@ -373,6 +390,8 @@ class AudioVAE(PreTrainedModel):
 
     @torch.inference_mode()
     def decode(self, latent, past_key_values=None, use_cache=False, stream_state=(None, None, None), last_chunk=False):
+        if self.decoder is None:
+            raise RuntimeError("AudioVAE decoder is unavailable in encoder-only mode.")
         if latent.dim() != 3:
             raise ValueError(f"Expected latent rank-3 [B,T,D], got shape={tuple(latent.shape)}")
         if latent.shape[0] <= 0:

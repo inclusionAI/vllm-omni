@@ -70,6 +70,39 @@ def test_audio_vae_encoder_and_aggregator_keep_independent_depths():
     assert len(encoder.aggregator.layers) == 4
 
 
+def test_audio_vae_builds_only_requested_components():
+    backbone = {
+        "vocab_size": 1,
+        "hidden_size": 8,
+        "intermediate_size": 16,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 16,
+    }
+    config = AudioVAEConfig(
+        patch_size=2,
+        enc_kwargs={"backbone": backbone, "input_dim": 4, "hop_size": 4, "latent_dim": 2},
+        dec_kwargs={"backbone": backbone, "output_dim": 4, "latent_dim": 2},
+    )
+
+    decoder_only = AudioVAE(config, build_encoder=False)
+    encoder_only = AudioVAE(config, build_decoder=False)
+
+    assert not hasattr(decoder_only, "encoder")
+    assert all(not name.startswith("encoder.") for name in decoder_only.state_dict())
+    assert any(name.startswith("decoder.") for name in decoder_only.state_dict())
+    assert not hasattr(encoder_only, "decoder")
+    assert all(not name.startswith("decoder.") for name in encoder_only.state_dict())
+    assert any(name.startswith("encoder.") for name in encoder_only.state_dict())
+    with pytest.raises(RuntimeError, match="decoder-only mode"):
+        decoder_only.encode_latent(torch.zeros((1, 4)), torch.tensor([4]))
+    with pytest.raises(RuntimeError, match="encoder-only mode"):
+        encoder_only.decode(torch.zeros((1, 1, 2)))
+    with pytest.raises(ValueError, match="at least one"):
+        AudioVAE(config, build_encoder=False, build_decoder=False)
+
+
 class _FixedPosteriorEncoder:
     def __init__(self, parameters):
         self.parameters = parameters

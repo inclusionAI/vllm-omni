@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Streaming LingV3 AudioVAE stage using the shared Ming implementation."""
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ class LingV3TTSAudioVAEModel(MingAudioVAEModel):
         self.ming_config = LingV3TTSRuntimeConfig.from_hf_config(vllm_config.model_config.hf_config)
         self.ming_config.validate()
         self.lingv3_config = self.ming_config
-        self.audio = AudioVAE(self.ming_config.audio_tokenizer_config)
+        self.audio = AudioVAE(self.ming_config.audio_tokenizer_config, build_encoder=False)
         self.have_multimodal_outputs = True
         self.has_preprocess = False
         self.has_postprocess = False
