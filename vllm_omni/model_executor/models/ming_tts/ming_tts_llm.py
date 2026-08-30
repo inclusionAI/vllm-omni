@@ -119,7 +119,7 @@ class MingLLMModel(nn.Module):
         self.stop_head.to(dtype=self.fm_dtype)
         self.spk_head.to(dtype=self.fm_dtype)
         self._pending_postprocess_updates: dict[str, dict[str, Any]] = {}
-        self._last_ming_next_token_ids = None
+        self._last_ming_next_token_ids: list[int] | None = None
         self._last_text_mode = False
         # CUDAGraph for the flow-matching (CFM) diffusion head — the TTFP/latency
         # hot spot. Set MING_CFM_CUDAGRAPH=0 to force the eager flow head.
@@ -144,13 +144,18 @@ class MingLLMModel(nn.Module):
         latent_history: torch.Tensor | None = None,
         model_intermediate_buffer: list[dict[str, Any]] | None = None,
         seq_token_counts: list[int] | None = None,
+        request_token_spans: list[tuple[int, int]] | None = None,
+        request_sample_eligible: list[bool] | None = None,
         **kwargs: object,
     ) -> OmniOutput | IntermediateTensors | torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
-        if model_intermediate_buffer is None:
-            model_intermediate_buffer = kwargs.get("runtime_additional_information")
-        request_infos = _normalize_request_infos(model_intermediate_buffer)
+        runtime_information = (
+            model_intermediate_buffer
+            if model_intermediate_buffer is not None
+            else kwargs.get("runtime_additional_information")
+        )
+        request_infos = _normalize_request_infos(runtime_information)
         self._validate_decode_window(request_infos)
         # Positional call: Qwen2Model names the 2nd arg ``positions`` while
         # BailingMoeModel names it ``position_ids`` — both share the signature
@@ -165,7 +170,12 @@ class MingLLMModel(nn.Module):
             self._last_ming_next_token_ids = None
             return backbone_out
         hidden_states = _extract_hidden_states(backbone_out)
-        token_counts = _get_request_token_counts(hidden_states, request_infos, seq_token_counts)
+        token_counts = _get_request_token_counts(
+            hidden_states,
+            request_infos,
+            seq_token_counts,
+            request_token_spans,
+        )
         text_mode = bool(request_infos) and all(bool(info.get(KEY_TEXT_MODE, False)) for info in request_infos)
         if request_infos and any(bool(info.get(KEY_TEXT_MODE, False)) for info in request_infos) and not text_mode:
             raise RuntimeError("Mixed Ming text/audio modes in one Stage-0 batch are unsupported.")
@@ -186,19 +196,37 @@ class MingLLMModel(nn.Module):
         if latent_history is not None and not token_counts:
             token_counts, request_infos = [hidden_states.shape[0]], [{KEY_LATENT_HISTORY: latent_history}]
 
+        if request_sample_eligible is None:
+            sample_eligible = [True] * len(token_counts)
+        elif len(request_sample_eligible) != len(token_counts):
+            raise RuntimeError(
+                "Ming request_sample_eligible/request span mismatch: "
+                f"got {len(request_sample_eligible)} flags for {len(token_counts)} requests."
+            )
+        else:
+            sample_eligible = [bool(flag) for flag in request_sample_eligible]
+
         total_tokens = hidden_states.shape[0]
         latent_patch_tokens = next_embed_tokens = new_history_tokens = None
         decode_step_tokens = has_patch = stop_reason_code_tokens = None
-        next_token_ids = []
+        next_token_ids = [int(self.ming_config.text_eos_token_id)] * len(token_counts)
         pending_updates: dict[str, dict[str, Any]] = {}
         cursor = 0
         any_decode = False
-        vectorized_results = self._vectorized_decode_results(hidden_states, request_infos, token_counts)
+        vectorized_results = self._vectorized_decode_results(
+            hidden_states,
+            request_infos,
+            token_counts,
+            sample_eligible,
+        )
         for req_idx, token_count in enumerate(token_counts):
             end = min(cursor + token_count, total_tokens)
             if end <= cursor:
                 continue
             req_info = request_infos[req_idx] if req_idx < len(request_infos) else {}
+            if not sample_eligible[req_idx]:
+                cursor = end
+                continue
             req_id = req_info.get(KEY_REQUEST_ID)
             req_history = _coerce_latent_history(
                 req_info.get(KEY_LATENT_HISTORY), device=hidden_states.device, dtype=self.fm_dtype, cfg=self.ming_config
@@ -253,7 +281,7 @@ class MingLLMModel(nn.Module):
             )
             stop_reason_code_tokens[output_index : output_index + 1] = self.stop_reason_codes[stop_reason]
             self._on_stop_decision(req_info, stop_reason)
-            next_token_ids.append(int(next_token_id))
+            next_token_ids[req_idx] = int(next_token_id)
             if isinstance(req_id, str):
                 pending_updates[req_id] = {
                     KEY_LATENT_HISTORY: new_history,
@@ -462,6 +490,7 @@ class MingLLMModel(nn.Module):
         hidden_states: torch.Tensor,
         request_infos: list[dict[str, Any]],
         token_counts: list[int],
+        sample_eligible: list[bool],
     ) -> dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         """Batch compatible flow-head calls while preserving request RNGs."""
         if not self.vectorize_cfm_decode or len(token_counts) < 2:
@@ -473,6 +502,9 @@ class MingLLMModel(nn.Module):
         for req_idx, token_count in enumerate(token_counts):
             end = min(cursor + token_count, total_tokens)
             if end <= cursor:
+                continue
+            if not sample_eligible[req_idx]:
+                cursor = end
                 continue
             req_info = request_infos[req_idx] if req_idx < len(request_infos) else {}
             req_history = _coerce_latent_history(

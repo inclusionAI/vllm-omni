@@ -40,11 +40,6 @@ From the vLLM-Omni repository root, launch with
 vllm serve /path/to/lingv3_tts \
   --omni \
   --port 8000
-
-vllm serve /path/to/lingv3_tts \
-  --omni \
-  --deploy-config vllm_omni/deploy/lingv3_tts.yaml \
-  --port 8000
 ```
 
 #### Verification

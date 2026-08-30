@@ -54,6 +54,7 @@ class LingV3TTSForConditionalGeneration(
     CustomProcessMixin,
 ):
     packed_modules_mapping = BailingMoeV3ForCausalLM.packed_modules_mapping
+    requires_request_sample_eligibility = True
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()

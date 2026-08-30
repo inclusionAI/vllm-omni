@@ -19,6 +19,7 @@ from vllm_omni.model_executor.models.common.ming.cfm_head import FlowLoss
 from vllm_omni.model_executor.models.common.ming.cfm_solver import Solver, get_epss_timesteps
 from vllm_omni.model_executor.models.common.ming.speaker_extractor import SpeakerEmbeddingExtractor
 from vllm_omni.model_executor.models.common.ming.spk_embedding import SpkembExtractor
+from vllm_omni.model_executor.models.ming_tts.config_ming_tts import KEY_LATENT_HISTORY, KEY_REQUEST_ID
 from vllm_omni.model_executor.models.ming_tts.constants import (
     AGGREGATOR_HIDDEN_SIZE,
     HISTORY_PATCH_SIZE,
@@ -412,11 +413,123 @@ def _make_ming_logits_model(vocab_size=8):
     return model
 
 
+def _make_ming_forward_model():
+    class FakeBackbone:
+        def __call__(self, input_ids, positions, intermediate_tensors, inputs_embeds):
+            return inputs_embeds
+
+    model = _make_ming_logits_model()
+    model.ming_config = SimpleNamespace(
+        llm_vocab_size=8,
+        llm_hidden_size=4,
+        latent_dim=2,
+        patch_size=1,
+        history_patch_size=2,
+        cfg=2.0,
+        sigma=0.25,
+        temperature=1.0,
+        max_decode_steps=8,
+        stop_head_threshold=0.5,
+        stop_head_min_steps=0,
+        audio_dummy_token_id=6,
+        text_eos_token_id=7,
+    )
+    model.model = FakeBackbone()
+    model.fm_dtype = torch.float32
+    model.vectorize_cfm_decode = True
+    model._draw_request_cfm_noises = lambda generators, device: (
+        torch.zeros((len(generators), 1, 2), device=device),
+        torch.zeros((10, len(generators), 1, 2), device=device),
+    )
+    model._pending_postprocess_updates = {}
+    model._validate_decode_window = lambda request_infos: None
+    model._get_request_generator = lambda request_info, device: None
+    model._on_stop_decision = lambda request_info, stop_reason: None
+    model._resolve_stop_decision = lambda **kwargs: (
+        "continue",
+        False,
+        False,
+        0,
+        kwargs["audio_dummy_token_id"],
+    )
+    model.stop_reason_codes = {"continue": 0}
+    return model
+
+
+def _run_ming_batched_forward(request_token_spans, request_sample_eligible):
+    model = _make_ming_forward_model()
+    decoded_hidden = []
+
+    def decode_one_step(*, hidden_states, latent_history, **kwargs):
+        decoded_hidden.append(hidden_states.detach().clone())
+        batch_size = hidden_states.shape[0]
+        return (
+            hidden_states.new_ones((batch_size, 1, 2)),
+            hidden_states.new_ones((batch_size, 1, 4)),
+            latent_history.clone(),
+            hidden_states.new_zeros((batch_size,)),
+        )
+
+    model._decode_one_step = decode_one_step
+    inputs_embeds = torch.arange(20, dtype=torch.float32).reshape(5, 4)
+    request_infos = [
+        {KEY_REQUEST_ID: "req-0", KEY_LATENT_HISTORY: torch.zeros((2, 2))},
+        {KEY_REQUEST_ID: "req-1", KEY_LATENT_HISTORY: torch.zeros((2, 2))},
+    ]
+    output = MingLLMModel.forward(
+        model,
+        input_ids=torch.arange(5),
+        positions=torch.arange(5),
+        inputs_embeds=inputs_embeds,
+        model_intermediate_buffer=request_infos,
+        request_token_spans=request_token_spans,
+        request_sample_eligible=request_sample_eligible,
+    )
+    return model, output, inputs_embeds, decoded_hidden
+
+
+def test_ming_forward_aligns_uneven_request_spans_with_sampler_rows():
+    model, output, inputs_embeds, decoded_hidden = _run_ming_batched_forward(
+        [(0, 2), (2, 5)],
+        [True, True],
+    )
+
+    assert isinstance(output, OmniOutput)
+    assert output.multimodal_outputs is not None
+    assert model._last_ming_next_token_ids == [6, 6]
+    assert len(decoded_hidden) == 1
+    torch.testing.assert_close(decoded_hidden[0], inputs_embeds[[1, 4]])
+    assert output.multimodal_outputs[model.has_patch_key].tolist() == [False, True, False, False, True]
+
+    logits = MingLLMModel.compute_logits(model, torch.zeros((2, 4)), SimpleNamespace())
+    assert logits is not None
+    assert logits[:, 6].tolist() == [0.0, 0.0]
+
+
+def test_ming_forward_skips_ineligible_chunked_prefill_without_losing_batch_alignment():
+    model, output, inputs_embeds, decoded_hidden = _run_ming_batched_forward(
+        [(0, 1), (1, 5)],
+        [True, False],
+    )
+
+    assert isinstance(output, OmniOutput)
+    assert output.multimodal_outputs is not None
+    assert model._last_ming_next_token_ids == [6, 7]
+    torch.testing.assert_close(torch.cat(decoded_hidden), inputs_embeds[[0]])
+    assert output.multimodal_outputs[model.has_patch_key].tolist() == [True, False, False, False, False]
+
+    logits = MingLLMModel.compute_logits(model, torch.zeros((2, 4)), SimpleNamespace())
+    assert logits is not None
+    assert logits[0, 6].item() == 0.0
+    assert logits[1, 7].item() == 0.0
+
+
 def test_ming_compute_logits_uses_cached_forced_next_token_ids():
     model = _make_ming_logits_model()
     model._last_ming_next_token_ids = [2, 5]
 
     logits = MingLLMModel.compute_logits(model, torch.zeros((2, 4)), SimpleNamespace())
+    assert logits is not None
 
     assert logits.shape == (2, 8)
     assert logits[0, 2].item() == 0.0
@@ -430,6 +543,7 @@ def test_ming_compute_logits_falls_back_to_dummy_token_id():
     model = _make_ming_logits_model()
 
     logits = MingLLMModel.compute_logits(model, torch.zeros((1, 4)), SimpleNamespace())
+    assert logits is not None
     assert logits.shape == (1, 8)
     assert logits[0, 7].item() == 0.0
     assert torch.isneginf(logits[0, [0, 1, 2, 3, 4, 5, 6]]).all()

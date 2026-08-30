@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/modeling_bailingmm.py
 from __future__ import annotations
 
@@ -26,7 +26,28 @@ def _get_request_token_counts(
     hidden_states: torch.Tensor,
     request_infos: list[dict[str, Any]],
     seq_token_counts: list[int] | None,
+    request_token_spans: list[tuple[int, int]] | None = None,
 ) -> list[int]:
+    if request_token_spans is not None:
+        if len(request_token_spans) != len(request_infos):
+            raise RuntimeError(
+                "Ming request_token_spans/request info mismatch: "
+                f"got {len(request_token_spans)} spans for {len(request_infos)} requests."
+            )
+        span_counts: list[int] = []
+        expected_start = 0
+        for start, end in request_token_spans:
+            start, end = int(start), int(end)
+            if start != expected_start or end < start or end > hidden_states.shape[0]:
+                raise RuntimeError(
+                    "Invalid Ming request_token_spans: "
+                    f"expected contiguous span starting at {expected_start}, got ({start}, {end}) "
+                    f"for {hidden_states.shape[0]} hidden rows."
+                )
+            span_counts.append(end - start)
+            expected_start = end
+        return span_counts
+
     if seq_token_counts:
         return [int(x) for x in seq_token_counts]
 
