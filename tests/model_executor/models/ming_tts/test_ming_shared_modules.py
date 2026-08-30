@@ -12,7 +12,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import (
     parse_ming_instruction_fields,
 )
 from vllm_omni.model_executor.models.common.ming.aggregator import Aggregator
-from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE, AudioVAEConfig
+from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE, AudioVAEConfig, Encoder
 from vllm_omni.model_executor.models.common.ming.cfm_cudagraph import CFMGraphExecutor, CFMSampler
 from vllm_omni.model_executor.models.common.ming.cfm_dit import DiT
 from vllm_omni.model_executor.models.common.ming.cfm_head import FlowLoss
@@ -49,6 +49,25 @@ def test_ming_tts_audio_vae_uses_common_config():
 
     assert cfg.sample_rate == 16000
     assert cfg.patch_size == -1
+
+
+def test_audio_vae_encoder_and_aggregator_keep_independent_depths():
+    backbone = {
+        "vocab_size": 1,
+        "hidden_size": 8,
+        "intermediate_size": 16,
+        "num_hidden_layers": 6,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 16,
+    }
+
+    encoder = Encoder(backbone, input_dim=4, hop_size=4, latent_dim=2, patch_size=2)
+
+    assert encoder.encoder.config.num_hidden_layers == 6
+    assert len(encoder.encoder.layers) == 6
+    assert encoder.aggregator.config.num_hidden_layers == 4
+    assert len(encoder.aggregator.layers) == 4
 
 
 class _FixedPosteriorEncoder:

@@ -76,6 +76,8 @@ def _config() -> LingV3TTSConfig:
         "kv_lora_rank": 512,
         "qk_rope_head_dim": 64,
         "short_conv_kernel_size": 4,
+        "kda_safe_gate": True,
+        "kda_lower_bound": -5.0,
     }
     audio = {
         "sample_rate": 44100,
@@ -110,6 +112,8 @@ def test_config_normalizes_bailing_and_keeps_independent_geometry():
     runtime.validate()
     assert config.llm_config.model_type == "bailing_hybrid"
     assert config.llm_config.checkpoint_model_type == "bailing_moe_v3"
+    assert config.llm_config.kda_safe_gate is False
+    assert config.llm_config.kda_lower_bound is None
     assert config.llm_config.kv_lora_rank + config.llm_config.qk_rope_head_dim == 576
     assert runtime.patch_size == runtime.history_patch_size == 1
     assert runtime.vae_patch_size == 4
@@ -178,7 +182,7 @@ def test_prefill_uses_vendor_prompt_posterior_and_continues_request_rng(monkeypa
         fm_dtype=torch.float32,
         project_speaker_embedding=lambda embedding: torch.zeros((1, 4)),
     )
-    wrapper = SimpleNamespace(
+    wrapper: Any = SimpleNamespace(
         model=model,
         ming_config=SimpleNamespace(history_patch_size=1, latent_dim=64),
         _copy_request_state=lambda update, info: None,

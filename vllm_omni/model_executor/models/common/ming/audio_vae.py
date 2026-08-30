@@ -138,8 +138,9 @@ class Encoder(nn.Module):
         self.norm = nn.LayerNorm(config.hidden_size)
         self.patch_size = patch_size
         if patch_size != -1:
-            config.num_hidden_layers = 4
-            self.aggregator = Qwen2Model(config)
+            aggregator_config = _qwen2_config(encoder_args)
+            aggregator_config.num_hidden_layers = 4
+            self.aggregator = Qwen2Model(aggregator_config)
             self.cls_embed = nn.Parameter(torch.rand(1, 1, config.hidden_size))
             self.cls_embed.data.normal_(0, 0.02)
 
