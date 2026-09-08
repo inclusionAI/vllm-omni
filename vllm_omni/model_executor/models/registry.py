@@ -267,6 +267,12 @@ _OMNI_MODELS = {
         "ming_tts_audio_vae",
         "MingAudioVAEModel",
     ),
+    ## Ming3 audio
+    "BailingMoeV3AudioForConditionalGeneration": (
+        "ming3_audio",
+        "ming3_audio",
+        "BailingMoeV3AudioForConditionalGeneration",
+    ),
     ## glm_image
     "GlmImageForConditionalGeneration": (
         "glm_image",
