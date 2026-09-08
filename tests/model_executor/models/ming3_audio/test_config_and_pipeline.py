@@ -13,6 +13,7 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
 from transformers import AutoConfig, PreTrainedTokenizerFast
 from vllm.config import VllmConfig
+from vllm.config.speech_to_text import SpeechToTextParams
 from vllm.model_executor.models.interfaces import (
     is_hybrid,
     supports_multimodal,
@@ -24,7 +25,6 @@ from vllm.tokenizers import cached_tokenizer_from_config
 
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config import OmniModelConfig
-from vllm_omni.config.endpoint_policy import OmniServingCapability
 from vllm_omni.config.pipeline_registry import resolve_pipeline_config
 from vllm_omni.config.stage_config import StageExecutionType, load_deploy_config
 from vllm_omni.model_executor.models.ming3_audio import (
@@ -285,6 +285,19 @@ def test_asr_service_does_not_split_model_context():
     assert translation_init_config.sample_rate == 16000
 
 
+def test_translation_is_rejected_by_model(tiny_model_config: OmniModelConfig):
+    stt_config = BailingMoeV3AudioForConditionalGeneration.get_speech_to_text_config(None, "translate")
+    params = SpeechToTextParams(
+        audio=np.zeros(160, dtype=np.float32),
+        stt_config=stt_config,
+        model_config=tiny_model_config,
+        task_type="translate",
+    )
+
+    with pytest.raises(ValueError, match="does not support translation"):
+        BailingMoeV3AudioForConditionalGeneration.get_generation_prompt(params)
+
+
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
@@ -309,8 +322,7 @@ def test_ming3_pipeline_is_single_stage_asr():
     assert pipeline is not None
     assert pipeline.model_arch == "BailingMoeV3AudioForConditionalGeneration"
     assert pipeline.default_deploy_config_name == "ming3_audio_flash.yaml"
-    assert len(pipeline.endpoint_restrictions) == 1
-    assert pipeline.endpoint_restrictions[0].capability is OmniServingCapability.TRANSLATIONS
+    assert pipeline.endpoint_restrictions == ()
     assert len(pipeline.stages) == 1
 
     stage = pipeline.get_stage(0)
