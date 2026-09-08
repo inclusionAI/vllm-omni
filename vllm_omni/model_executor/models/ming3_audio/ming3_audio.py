@@ -270,10 +270,8 @@ class BailingMoeV3AudioForConditionalGeneration(
 
     @classmethod
     def get_speech_to_text_config(cls, model_config: ModelConfig, task_type: str) -> SpeechToTextConfig:
-        # Upstream initializes both speech-to-text handlers for the shared
-        # ``transcription`` task. The pipeline rejects /v1/audio/translations;
-        # keep construction side-effect free and reject translation requests
-        # before they reach get_generation_prompt().
+        # Upstream initializes both speech-to-text handlers for the shared transcription task.
+        # Keep construction side-effect free and defer unsupported translation rejection to prompt construction.
         if task_type not in {"transcribe", "translate"}:
             raise ValueError(f"Unsupported speech-to-text task: {task_type}")
         return SpeechToTextConfig(
