@@ -84,6 +84,7 @@ from vllm_omni.model_executor.models.mammoth_moda2.pipeline import (
     MAMMOTH_MODA2_PIPELINE,
 )
 from vllm_omni.model_executor.models.mimo_audio.pipeline import MIMO_AUDIO_PIPELINE
+from vllm_omni.model_executor.models.ming3_audio.pipeline import MING3_AUDIO_FLASH_PIPELINE
 from vllm_omni.model_executor.models.ming_flash_omni.pipeline import (
     MING_FLASH_OMNI_IMAGE_PIPELINE,
     MING_FLASH_OMNI_PIPELINE,
@@ -140,6 +141,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "audex_tts": AUDEX_TTS_PIPELINE,
     "auk": AUK_PIPELINE,
     "aura_omni": AURA_OMNI_PIPELINE,
+    "bailing_moe_v3_audio": MING3_AUDIO_FLASH_PIPELINE,
     "bagel": BAGEL_PIPELINE,
     "bagel_single_stage": BAGEL_SINGLE_STAGE_PIPELINE,
     "bagel_think": BAGEL_THINK_PIPELINE,
