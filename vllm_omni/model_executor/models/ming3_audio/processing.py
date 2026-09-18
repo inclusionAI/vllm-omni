@@ -17,12 +17,12 @@ from vllm.multimodal.inputs import (
 from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
-    BaseMultiModalProcessor,
     BaseProcessingInfo,
     PromptReplacement,
     PromptUpdateDetails,
 )
 
+from vllm_omni.inputs.mm_processor import OmniMultiModalProcessor
 from vllm_omni.model_executor.models.common.ming.audio_lengths import (
     max_mel_frames_for_audio_tokens,
     ming3_audio_token_count,
@@ -123,7 +123,7 @@ class Ming3AudioDummyInputsBuilder(BaseDummyInputsBuilder[Ming3AudioProcessingIn
         }
 
 
-class Ming3AudioMultiModalProcessor(BaseMultiModalProcessor[Ming3AudioProcessingInfo]):
+class Ming3AudioMultiModalProcessor(OmniMultiModalProcessor[Ming3AudioProcessingInfo]):
     def _hf_processor_applies_updates(
         self,
         prompt_text: str,
@@ -209,7 +209,7 @@ class Ming3AudioMultiModalProcessor(BaseMultiModalProcessor[Ming3AudioProcessing
         return [
             PromptReplacement(
                 modality="audio",
-                target=AUDIO_PAD_TOKEN,
+                target=[audio_token_id],
                 replacement=replacement,
             )
         ]
