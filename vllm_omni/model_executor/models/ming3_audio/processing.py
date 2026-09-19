@@ -38,7 +38,8 @@ AUDIO_START_TOKEN = "<|audio_start|>"
 AUDIO_PAD_TOKEN = "<|audio_pad|>"
 AUDIO_END_TOKEN = "<|audio_end|>"
 ASR_PROMPT = (
-    "Please recognize the language of this speech and transcribe it, "
+    "Please recognize the language of this speech and transcribe it with "
+    "appropriate punctuation marks, "
     "placing a `\t` between the identified language and the transcribe."
 )
 _SAMPLE_RATE = 16000

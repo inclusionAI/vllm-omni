@@ -283,10 +283,22 @@ class BailingMoeV3AudioForConditionalGeneration(
             raise ValueError("Ming-3.0-audio-flash does not support translation")
         if stt_params.request_prompt:
             raise ValueError("Ming-3.0-audio-flash does not support a custom ASR prompt")
-        prompt = f"{cls.get_placeholder_str('audio', 0)}{ASR_PROMPT}"
         tokenizer = cached_tokenizer_from_config(stt_params.model_config)
+        prompt_token_ids = tokenizer.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": ASR_PROMPT},
+                        {"type": "audio"},
+                    ],
+                }
+            ],
+            tokenize=True,
+            add_generation_prompt=True,
+        )
         return TokensPrompt(
-            prompt_token_ids=tokenizer.encode(prompt),
+            prompt_token_ids=prompt_token_ids,
             multi_modal_data={"audio": stt_params.audio},
         )
 

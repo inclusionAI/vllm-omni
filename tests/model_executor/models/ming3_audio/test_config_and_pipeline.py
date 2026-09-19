@@ -34,12 +34,34 @@ from vllm_omni.model_executor.models.ming3_audio.ming3_audio import (
     BailingMoeV3AudioForConditionalGeneration,
     Ming3AudioStreamingPostProcessor,
 )
+from vllm_omni.model_executor.models.ming3_audio.processing import ASR_PROMPT
 from vllm_omni.model_executor.models.registry import OmniModelRegistry
 from vllm_omni.transformers_utils.configs.ming3_audio import (
     BailingMoeV3AudioConfig,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+_TEST_CHAT_TEMPLATE = """\
+{%- for message in messages -%}
+{{- '<role>' + message['role']|upper + '</role>' -}}
+{%- if message['content'] is string -%}
+{{- message['content'] -}}
+{%- else -%}
+{%- for item in message['content'] -%}
+{%- if item['type'] == 'audio' -%}
+{{- '<|audio_start|><|audio_pad|><|audio_end|>' -}}
+{%- elif item['type'] == 'text' -%}
+{{- item['text'] -}}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{{- '<|role_end|>' -}}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{- '<role>ASSISTANT</role>' -}}
+{%- endif -%}
+"""
 
 
 @pytest.fixture(scope="module")
@@ -102,6 +124,7 @@ def tiny_model_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
     tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=backend,
         unk_token="[UNK]",
+        chat_template=_TEST_CHAT_TEMPLATE,
         additional_special_tokens=[
             "<|audio_start|>",
             "<|audio_end|>",
@@ -178,16 +201,27 @@ def test_native_config_loads_without_remote_code(tiny_model_path: Path):
     assert config.get_text_config() is config.text_config
 
 
-def test_native_audio_preprocessing_without_remote_code(
+def test_speech_qa_uses_native_audio_preprocessing(
     tiny_model_config: OmniModelConfig,
     tiny_processor,
 ):
     assert tiny_model_config.use_mla is True
     assert tiny_model_config.get_head_size() == 8
-    placeholder = BailingMoeV3AudioForConditionalGeneration.get_placeholder_str("audio", 0)
+    tokenizer = cached_tokenizer_from_config(tiny_model_config)
+    system_prompt = "回答音频中的问题，回答不要使用markdown格式。"
+    rendered_prompt = tokenizer.apply_chat_template(
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": [{"type": "audio"}]},
+        ],
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    assert system_prompt in rendered_prompt
+
     items = tiny_processor.info.parse_mm_data({"audio": (np.zeros(16000, dtype=np.float32), 16000)})
     output = tiny_processor(
-        placeholder + "test",
+        rendered_prompt,
         mm_items=items,
         hf_processor_mm_kwargs={},
     )
@@ -296,6 +330,37 @@ def test_translation_is_rejected_by_model(tiny_model_config: OmniModelConfig):
 
     with pytest.raises(ValueError, match="does not support translation"):
         BailingMoeV3AudioForConditionalGeneration.get_generation_prompt(params)
+
+
+def test_asr_generation_prompt_uses_checkpoint_chat_template(
+    tiny_model_config: OmniModelConfig,
+):
+    audio = np.zeros(160, dtype=np.float32)
+    stt_config = BailingMoeV3AudioForConditionalGeneration.get_speech_to_text_config(None, "transcribe")
+    params = SpeechToTextParams(
+        audio=audio,
+        stt_config=stt_config,
+        model_config=tiny_model_config,
+        task_type="transcribe",
+    )
+    prompt = BailingMoeV3AudioForConditionalGeneration.get_generation_prompt(params)
+    tokenizer = cached_tokenizer_from_config(tiny_model_config)
+    expected_ids = tokenizer.apply_chat_template(
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": ASR_PROMPT},
+                    {"type": "audio"},
+                ],
+            }
+        ],
+        tokenize=True,
+        add_generation_prompt=True,
+    )
+
+    assert prompt["prompt_token_ids"] == expected_ids
+    assert prompt["multi_modal_data"]["audio"] is audio
 
 
 @pytest.mark.parametrize(
