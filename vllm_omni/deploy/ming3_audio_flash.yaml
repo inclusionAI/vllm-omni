@@ -1,4 +1,4 @@
-# Ming-3.0-audio-flash: single-stage long-context ASR.
+# Ming-3.0-audio-flash: single-stage audio understanding (ASR / Speech QA).
 #
 # Memory-minimum baseline for four 80 GB-class CUDA devices. It favors
 # reliable bring-up over concurrency; benchmark before enabling graphs or EP.

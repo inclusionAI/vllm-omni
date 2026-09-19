@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Single-stage ASR topology for Ming-3.0-audio-flash."""
+"""Single-stage audio-understanding topology for Ming-3.0-audio-flash."""
 
 from vllm_omni.config.stage_config import (
     PipelineConfig,
@@ -16,7 +16,7 @@ MING3_AUDIO_FLASH_PIPELINE = PipelineConfig(
     stages=(
         StagePipelineConfig(
             stage_id=0,
-            model_stage="asr",
+            model_stage="thinker",
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(),
             final_output=True,
