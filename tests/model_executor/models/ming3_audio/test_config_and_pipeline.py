@@ -121,7 +121,7 @@ def tiny_model_config(tiny_model_path: Path) -> OmniModelConfig:
         max_model_len=128,
         limit_mm_per_prompt={"audio": 1},
         model_arch="BailingMoeV3AudioForConditionalGeneration",
-        model_stage="asr",
+        model_stage="thinker",
         hf_config_name="text_config",
     )
 
@@ -316,7 +316,7 @@ def test_streaming_language_prefix_post_processing():
     assert processor.process_delta(" world", finished=True) == " world"
 
 
-def test_ming3_pipeline_is_single_stage_asr():
+def test_ming3_pipeline_is_single_stage_audio_understanding():
     pipeline = resolve_pipeline_config("bailing_moe_v3_audio")
 
     assert pipeline is not None
@@ -326,7 +326,7 @@ def test_ming3_pipeline_is_single_stage_asr():
     assert len(pipeline.stages) == 1
 
     stage = pipeline.get_stage(0)
-    assert stage.model_stage == "asr"
+    assert stage.model_stage == "thinker"
     assert stage.execution_type is StageExecutionType.LLM_AR
     assert stage.input_sources == ()
     assert stage.final_output is True
