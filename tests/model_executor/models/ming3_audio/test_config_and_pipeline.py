@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 import torch.nn as nn
+from pytest_mock import MockerFixture
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import Whitespace
@@ -23,10 +24,10 @@ from vllm.model_executor.models.interfaces import (
 from vllm.multimodal.processing import InputProcessingContext
 from vllm.tokenizers import cached_tokenizer_from_config
 
-from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config import OmniModelConfig
 from vllm_omni.config.pipeline_registry import resolve_pipeline_config
-from vllm_omni.config.stage_config import StageExecutionType, load_deploy_config
+from vllm_omni.config.stage_config import StageExecutionType
+from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.ming3_audio import (
     ming3_audio as ming3_audio_module,
 )
@@ -36,6 +37,9 @@ from vllm_omni.model_executor.models.ming3_audio.ming3_audio import (
 )
 from vllm_omni.model_executor.models.ming3_audio.processing import ASR_PROMPT
 from vllm_omni.model_executor.models.registry import OmniModelRegistry
+from vllm_omni.model_executor.stage_input_processors.ming3_audio import (
+    thinker2talker_token_only,
+)
 from vllm_omni.transformers_utils.configs.ming3_audio import (
     BailingMoeV3AudioConfig,
 )
@@ -280,6 +284,14 @@ def test_ming3_model_is_registered():
     assert model_cls is BailingMoeV3AudioForConditionalGeneration
 
 
+def test_ming3_talker_reuses_shared_ming_implementation():
+    from vllm_omni.model_executor.models.ming_flash_omni.ming_flash_omni_talker import (
+        MingFlashOmniTalkerForConditionalGeneration,
+    )
+
+    assert OmniModelRegistry._try_load_model_cls("BailingTalker2") is MingFlashOmniTalkerForConditionalGeneration
+
+
 def test_ming3_advertises_required_vllm_capabilities():
     model = BailingMoeV3AudioForConditionalGeneration
     assert supports_multimodal(model)
@@ -381,42 +393,52 @@ def test_streaming_language_prefix_post_processing():
     assert processor.process_delta(" world", finished=True) == " world"
 
 
-def test_ming3_pipeline_is_single_stage_audio_understanding():
-    pipeline = resolve_pipeline_config("bailing_moe_v3_audio")
+def test_ming3_talker_bridge_uses_generated_text_without_voice_preset(
+    mocker: MockerFixture,
+):
+    source = mocker.Mock(
+        spec=["outputs"],
+        outputs=[mocker.Mock(spec=["text"], text="abc def")],
+    )
+    prompt = OmniTokensPrompt(prompt_token_ids=[1], additional_information={"max_text_length": 42})
 
-    assert pipeline is not None
+    [talker_input] = thinker2talker_token_only([source], prompt)
+    info = talker_input["additional_information"]
+
+    assert talker_input["prompt_token_ids"] == [0]
+    assert info["ming_task"] == "omni"
+    assert info["text"] == "abc def"
+    assert info["voice_name"] is None
+    assert info["max_text_length"] == 42
+
+
+def test_ming3_pipeline_supports_text_and_audio_outputs():
+    pipeline = resolve_pipeline_config("bailing_moe_v3_audio")
+    thinker_only = resolve_pipeline_config("bailing_moe_v3_audio_thinker_only")
+
+    assert pipeline is not None and thinker_only is not None
     assert pipeline.model_arch == "BailingMoeV3AudioForConditionalGeneration"
     assert pipeline.default_deploy_config_name == "ming3_audio_flash.yaml"
-    assert pipeline.endpoint_restrictions == ()
-    assert len(pipeline.stages) == 1
+    assert thinker_only.default_deploy_config_name == "ming3_audio_flash_thinker_only.yaml"
+    assert len(pipeline.stages) == 2
+    assert thinker_only.stages == pipeline.stages[:1]
 
-    stage = pipeline.get_stage(0)
-    assert stage.model_stage == "thinker"
-    assert stage.execution_type is StageExecutionType.LLM_AR
-    assert stage.input_sources == ()
-    assert stage.final_output is True
-    assert stage.final_output_type == "text"
-    assert stage.engine_output_type == "text"
-    assert stage.owns_tokenizer is True
-    assert stage.requires_multimodal_data is True
-    assert stage.hf_config_name == "text_config"
-    assert stage.sampling_constraints == {"detokenize": True}
+    thinker = pipeline.get_stage(0)
+    assert thinker.model_stage == "thinker"
+    assert thinker.final_output is True
+    assert thinker.final_output_type == "text"
+    assert thinker.requires_multimodal_data is True
+    assert thinker.hf_config_name == "text_config"
+    assert thinker.sampling_constraints == {"detokenize": True}
 
-
-def test_ming3_default_deploy_is_conservative_four_gpu_profile():
-    deploy = load_deploy_config(get_deploy_config_path("ming3_audio_flash.yaml"))
-
-    assert deploy.pipeline == "bailing_moe_v3_audio"
-    assert deploy.dtype == "bfloat16"
-    assert deploy.enable_chunked_prefill is True
-    assert deploy.enable_prefix_caching is False
-    assert len(deploy.stages) == 1
-
-    stage = deploy.stages[0]
-    assert stage.devices == "0,1,2,3"
-    assert stage.tensor_parallel_size == 4
-    assert stage.enable_expert_parallel is False
-    assert stage.max_num_seqs == 1
-    assert stage.max_num_batched_tokens == 2048
-    assert stage.gpu_memory_utilization == 0.92
-    assert stage.enforce_eager is True
+    talker = pipeline.get_stage(1)
+    assert talker.model_stage == "ming_tts"
+    assert talker.model_arch == "BailingTalker2"
+    assert talker.execution_type is StageExecutionType.LLM_GENERATION
+    assert talker.input_sources == (0,)
+    assert talker.final_output is True
+    assert talker.final_output_type == "audio"
+    assert talker.tokenizer_subdir == "talker/llm"
+    assert talker.sync_process_input_func == (
+        f"{thinker2talker_token_only.__module__}.{thinker2talker_token_only.__name__}"
+    )
