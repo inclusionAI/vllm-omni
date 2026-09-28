@@ -273,6 +273,11 @@ _OMNI_MODELS = {
         "ming3_audio",
         "BailingMoeV3AudioForConditionalGeneration",
     ),
+    "BailingTalker2": (
+        "ming_flash_omni",
+        "ming_flash_omni_talker",
+        "MingFlashOmniTalkerForConditionalGeneration",
+    ),
     ## glm_image
     "GlmImageForConditionalGeneration": (
         "glm_image",
