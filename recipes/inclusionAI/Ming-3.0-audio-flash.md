@@ -1,25 +1,24 @@
 # Ming-3.0-audio-flash
 
-> Online serving for multilingual ASR and single-turn speech QA
+> Online multilingual ASR and speech QA with optional spoken answers
 
 ## Summary
 
 - Vendor: inclusionAI
 - Model: `inclusionAI/Ming-3.0-audio-flash`
-- Tasks: 16 kHz multilingual ASR and audio question answering with text output
+- Tasks: 16 kHz multilingual ASR and speech QA with text or 44.1 kHz audio output
 - Mode: Online serving with the OpenAI-compatible Chat Completions API
 - Maintainer: Community
 
 ## When to use this recipe
 
-Use this recipe to transcribe multilingual audio or answer a question spoken
-in an audio clip. Both tasks use the same audio-understanding stage; the ChatML
-messages select the behavior.
+Use this recipe to transcribe multilingual audio or answer a question spoken in an audio clip.
+ASR and Speech QA share the Ming3 audio thinker; requests for audio output additionally run the bundled Ming talker and AudioVAE.
 
 ## Serve
 
-The bundled deployment configuration targets four 80 GB-class GPUs with
-tensor parallelism, chunked prefill, and eager execution.
+The default end-to-end configuration targets four 80 GB-class GPUs.
+The thinker runs with TP=4 and the talker is colocated on GPU 3.
 
 ```bash
 vllm serve inclusionAI/Ming-3.0-audio-flash \
@@ -27,6 +26,9 @@ vllm serve inclusionAI/Ming-3.0-audio-flash \
     --deploy-config vllm_omni/deploy/ming3_audio_flash.yaml \
     --port 8091
 ```
+
+`"modalities": ["text"]` stops after the thinker.
+`"modalities": ["text", "audio"]` runs the talker and returns the same answer as text and speech.
 
 ### 2 x H200 profile
 
@@ -41,7 +43,11 @@ stages:
   - stage_id: 0
     devices: "0,1"
     tensor_parallel_size: 2
-    gpu_memory_utilization: 0.95
+    gpu_memory_utilization: 0.88
+
+  - stage_id: 1
+    devices: "1"
+    gpu_memory_utilization: 0.10
 ```
 
 Launch the server with
@@ -52,6 +58,17 @@ vllm serve /path/to/inclusionAI/Ming-3.0-audio-flash \
     --deploy-config vllm_omni/deploy/ming3_audio_flash_2gpu_h200.yaml \
     --init-timeout 1800 \
     --stage-init-timeout 1800 \
+    --port 8091
+```
+
+### Text-only deployment
+
+When the service only needs ASR or Speech QA text, avoid loading the talker:
+
+```bash
+vllm serve inclusionAI/Ming-3.0-audio-flash \
+    --omni \
+    --deploy-config vllm_omni/deploy/ming3_audio_flash_thinker_only.yaml \
     --port 8091
 ```
 
@@ -113,12 +130,23 @@ base64 -w0 "$MING3_AUDIO_FILE" | jq -Rs '{
     --data-binary @- | jq -r '.choices[0].message.content'
 ```
 
+To receive a spoken answer, set `modalities` to `["text", "audio"]` and save the curl response as `response.json`.
+The answer is at `.choices[0].message.content`; the base64 WAV is at `.choices[0].message.audio.data`:
+
+```bash
+jq -r '.choices[0].message.audio.data' response.json \
+    | base64 -d > ming3_speech_qa.wav
+```
+
 ## Notes
 
 - The response format is `language<TAB>transcription`. Clients that need only
   the transcript can split the returned text at the first tab.
 - Speech QA returns a direct answer rather than a transcript. It uses Chat
   Completions and is not passed through the ASR language-prefix postprocessor.
+- The released talker has no `voice_name.json`; the end-to-end path therefore
+  uses its zero-speaker-embedding fallback unless speaker conditioning is supplied explicitly.
+- The talker emits mono 44.1 kHz audio.
 - Use Chat Completions for transcription; the `/v1/audio/transcriptions`
   endpoint is not currently available with `--omni`.
 - The model handles audio chunking internally, so the deployment configuration
