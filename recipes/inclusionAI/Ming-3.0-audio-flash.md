@@ -30,7 +30,7 @@ vllm serve inclusionAI/Ming-3.0-audio-flash \
 `"modalities": ["text"]` stops after the thinker.
 `"modalities": ["text", "audio"]` runs the talker and returns the same answer as text and speech.
 
-### 2 x H200 profile
+### 2 x H200
 
 For two H200 GPUs, use the validated TP=2 deployment configuration:
 
@@ -102,8 +102,7 @@ curl http://localhost:8091/v1/chat/completions \
 
 ## Ask a question in audio
 
-The following request mirrors the vendor Speech QA example. Replace the local
-path if the checkpoint is stored elsewhere.
+Example inputs:
 
 ```bash
 MING3_AUDIO_FILE=/path/to/inclusionAI/Ming-3.0-audio-flash/examples/audio_files/introduce_ant_group.wav
@@ -130,24 +129,44 @@ base64 -w0 "$MING3_AUDIO_FILE" | jq -Rs '{
     --data-binary @- | jq -r '.choices[0].message.content'
 ```
 
-To receive a spoken answer, set `modalities` to `["text", "audio"]` and save the curl response as `response.json`.
-The answer is at `.choices[0].message.content`; the base64 WAV is at `.choices[0].message.audio.data`:
+## Speak the answer
+
+Using the `DB30` Talker preset (by default). The two stages stay loaded in the service.
 
 ```bash
+base64 -w0 "$MING3_AUDIO_FILE" | jq -Rs '{
+  model: "/path/to/inclusionAI/Ming-3.0-audio-flash",
+  messages: [
+    {
+      role: "system",
+      content: "请用一句简短的话回答音频中的问题，不超过50个汉字，不要使用Markdown格式。"
+    },
+    {
+      role: "user",
+      content: [{
+        type: "audio_url",
+        audio_url: {url: ("data:audio/wav;base64," + .)}
+      }]
+    }
+  ],
+  modalities: ["text", "audio"],
+  additional_information: {voice_name: "DB30"},
+  temperature: 0,
+  max_tokens: 128
+}' | curl --fail-with-body http://localhost:8091/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    --data-binary @- -o response.json
+jq -r '.choices[0].message.content' response.json
 jq -r '.choices[0].message.audio.data' response.json \
     | base64 -d > ming3_speech_qa.wav
 ```
 
 ## Notes
 
-- The response format is `language<TAB>transcription`. Clients that need only
-  the transcript can split the returned text at the first tab.
-- Speech QA returns a direct answer rather than a transcript. It uses Chat
-  Completions and is not passed through the ASR language-prefix postprocessor.
-- The released talker has no `voice_name.json`; the end-to-end path therefore
-  uses its zero-speaker-embedding fallback unless speaker conditioning is supplied explicitly.
+- The response format is `language<TAB>transcription`. Clients that need only the transcript can split the returned text at the first tab.
+- Speech QA returns a direct answer rather than a transcript. It uses Chat Completions and is not passed through the ASR language-prefix postprocessor.
+- The current `talker/data/voice_name.json` provides `DB30` and `lingguang`. `DB30` is the default; set `additional_information.voice_name` explicitly to select a preset, or to `null` for the zero-speaker-embedding fallback.
 - The talker emits mono 44.1 kHz audio.
-- Use Chat Completions for transcription; the `/v1/audio/transcriptions`
-  endpoint is not currently available with `--omni`.
-- The model handles audio chunking internally, so the deployment configuration
-  does not set `max_audio_clip_s` or `min_energy_split_window_size`.
+- Use Chat Completions for transcription; the `/v1/audio/transcriptions` endpoint is not currently available with `--omni`.
+- The model handles audio chunking internally, so the deployment configuration does not set `max_audio_clip_s` or `min_energy_split_window_size`.
+- Although the checkpoint advertises 131072 text positions, the provided deployment profiles cap the thinker `max_model_len` at 8192.
