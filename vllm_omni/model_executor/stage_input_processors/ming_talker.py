@@ -15,8 +15,6 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 def build_ming_talker_additional_info(
     text: str,
     prompt: OmniTokensPrompt | TextPrompt | Mapping | None,
-    *,
-    default_voice_name: str | None = None,
 ) -> dict:
     """Preserve the same voice and generation defaults for sync/async handoffs."""
     if isinstance(prompt, Mapping):
@@ -24,7 +22,7 @@ def build_ming_talker_additional_info(
     else:
         additional_info = getattr(prompt, "additional_information", None) or {}
 
-    # Speaker embeddings may arrive as JSON lists.
+    # Speaker embeddings may arrive as nested JSON lists.
     spk_emb = additional_info.get("spk_emb")
     if isinstance(spk_emb, list) and spk_emb and not hasattr(spk_emb[0], "device"):
         spk_emb = torch.tensor(spk_emb, dtype=torch.float32).unsqueeze(0)
@@ -33,7 +31,7 @@ def build_ming_talker_additional_info(
         "ming_task": "omni",
         "text": text,
         "spk_emb": spk_emb,
-        "voice_name": additional_info.get("voice_name", default_voice_name),
+        "voice_name": additional_info.get("voice_name", "DB30"),
         "prompt_text": additional_info.get("prompt_text"),
         "prompt_wav_lat": additional_info.get("prompt_wav_lat"),
         "prompt_wav_emb": additional_info.get("prompt_wav_emb"),
@@ -44,8 +42,6 @@ def build_ming_talker_additional_info(
 def build_ming_talker_inputs(
     source_outputs: list,
     prompt: OmniTokensPrompt | TextPrompt | list[OmniTokensPrompt | TextPrompt] | None = None,
-    *,
-    default_voice_name: str | None = None,
 ) -> list[OmniTokensPrompt]:
     """Convert completed thinker text into self-contained Ming talker inputs."""
     prompts = prompt if isinstance(prompt, list) else [prompt]
@@ -58,9 +54,7 @@ def build_ming_talker_inputs(
             OmniTokensPrompt(
                 # The talker retokenizes text and builds its own embeddings.
                 prompt_token_ids=[0],
-                additional_information=build_ming_talker_additional_info(
-                    generated_text, original_prompt, default_voice_name=default_voice_name
-                ),
+                additional_information=build_ming_talker_additional_info(generated_text, original_prompt),
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
             )

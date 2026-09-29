@@ -202,7 +202,7 @@ def test_native_config_loads_without_remote_code(tiny_model_path: Path):
     assert config.audio_config.n_audio_layer == 1
     assert config.audio_config.downsampler_stride_list == [2, 2, 2]
     assert config.audio_token_id == 3
-    assert config.norm_query_embeds is True
+    assert config.norm_query_embeds is False
     assert config.get_text_config() is config.text_config
 
 
@@ -239,23 +239,22 @@ def test_speech_qa_uses_native_audio_preprocessing(
 
 def test_partial_dummy_model_executes_real_audio_path(
     tiny_model: BailingMoeV3AudioForConditionalGeneration,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     assert len(tiny_model.audio_encoder.blocks) == 1
     assert tiny_model.language_model.prefix == "language_model"
     assert tiny_model.language_model.vllm_config.model_config.hf_config.num_hidden_layers == 1
 
-    embeddings = tiny_model.embed_multimodal(
-        audio_feats=torch.zeros(1, 63, 80),
-        audio_feats_lengths=torch.tensor([[63]]),
-    )
+    features = torch.zeros(1, 63, 80)
+    lengths = torch.tensor([[63]])
+    embeddings = tiny_model.embed_multimodal(audio_feats=features, audio_feats_lengths=lengths)
 
     assert len(embeddings) == 1
     assert embeddings[0].shape == (4, 16)
     assert torch.isfinite(embeddings[0]).all()
-    torch.testing.assert_close(
-        torch.linalg.vector_norm(embeddings[0], dim=-1),
-        torch.ones(4),
-    )
+    monkeypatch.setattr(tiny_model.config, "norm_query_embeds", True)
+    normalized = tiny_model.embed_multimodal(audio_feats=features, audio_feats_lengths=lengths)
+    torch.testing.assert_close(normalized[0], torch.nn.functional.normalize(embeddings[0], dim=-1))
 
 
 def test_partial_dummy_model_loads_mapped_audio_weights(
@@ -370,6 +369,7 @@ def test_asr_generation_prompt_uses_checkpoint_chat_template(
         ],
         tokenize=True,
         add_generation_prompt=True,
+        enable_thinking=False,
     )
 
     assert prompt["prompt_token_ids"] == expected_ids
@@ -394,7 +394,7 @@ def test_streaming_language_prefix_post_processing():
     assert processor.process_delta(" world", finished=True) == " world"
 
 
-def test_ming3_talker_bridge_uses_generated_text_without_voice_preset(
+def test_ming3_talker_bridge_uses_generated_text_and_default_voice(
     mocker: MockerFixture,
 ):
     source = mocker.Mock(
@@ -409,7 +409,7 @@ def test_ming3_talker_bridge_uses_generated_text_without_voice_preset(
     assert talker_input["prompt_token_ids"] == [0]
     assert info["ming_task"] == "omni"
     assert info["text"] == "abc def"
-    assert info["voice_name"] is None
+    assert info["voice_name"] == "DB30"
     assert info["max_text_length"] == 42
 
 
@@ -459,7 +459,7 @@ def test_ming3_async_chunk_emits_stable_sentences_and_terminal_tail(mocker: Mock
     request = mocker.Mock(spec=["external_req_id", "prompt_token_ids", "all_token_ids", "additional_information"])
     request.external_req_id = "r1"
     request.prompt_token_ids = [99]
-    request.additional_information = {"max_text_length": 42}
+    request.additional_information = {"max_text_length": 42, "voice_name": "lingguang"}
 
     request.all_token_ids = [99, 1]
     assert thinker2talker_async_chunk(manager, None, request) is None
@@ -468,6 +468,7 @@ def test_ming3_async_chunk_emits_stable_sentences_and_terminal_tail(mocker: Mock
     assert first is not None
     assert first.additional_information["text"] == "你好。"
     assert first.additional_information["ming_task"] == "omni"
+    assert first.additional_information["voice_name"] == "lingguang"
     assert first.additional_information["max_text_length"] == 42
     assert first.codes.audio.tolist() == [0]
     assert first.meta.replace_runtime_additional_information is True

@@ -72,7 +72,7 @@ class BailingMoeV3AudioConfig(PretrainedConfig):
         text_config: dict[str, Any] | PretrainedConfig | None = None,
         audio_config: dict[str, Any] | BailingMoeV3AudioEncoderConfig | None = None,
         audio_token_id: int = 157168,
-        norm_query_embeds: bool = True,
+        norm_query_embeds: bool = False,
         **kwargs: Any,
     ) -> None:
         if isinstance(text_config, dict):
