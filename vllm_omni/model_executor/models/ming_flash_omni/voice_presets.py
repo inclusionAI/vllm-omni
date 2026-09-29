@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The vLLM-Omni team.
 # Copyright (c) Ant Group. All rights reserved.
 # Adapted from:
@@ -62,6 +63,7 @@ class VoicePresetRegistry:
     def get(self, voice_name: str) -> dict[str, Any] | None:
         return self.registered.get(voice_name)
 
+    @torch.no_grad()
     def register(
         self,
         voice_name: str,
