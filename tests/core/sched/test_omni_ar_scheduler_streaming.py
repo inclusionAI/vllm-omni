@@ -285,12 +285,12 @@ def test_resumable_segment_boundary_keeps_pre_transition_send_watermark() -> Non
     )
 
 
-def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> None:
-    """A decode step that neither stops nor carries an inter-stage payload.
+@pytest.mark.parametrize("token_only", [False, True])
+def test_running_token_only_decode_dispatch(token_only: bool) -> None:
+    """Token-only processors receive decode steps without inter-stage tensors.
 
-    ``finished`` is only assigned when the request stops, yet the async-chunk
-    save condition reads it for every request, so this step used to raise
-    ``UnboundLocalError: cannot access local variable 'finished'``.
+    Other processors still skip those steps. The condition must also tolerate
+    an unfinished request, where finished is not set by the stop branch.
     """
     session = _make_request()
     session.status = RequestStatus.RUNNING
@@ -302,6 +302,8 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
     sched._update_request_with_output.return_value = ([42], False)
     sched._process_kv_transfer_trigger.return_value = False
     sched.chunk_transfer_adapter = MagicMock()
+    processor = sched.chunk_transfer_adapter.custom_process_next_stage_input_func
+    processor._requires_full_token_history = token_only
     sched.running = [session]
     sched.waiting_for_transfer_free = set()
     sched.transfer_triggered_requests = set()
@@ -332,8 +334,16 @@ def test_running_decode_step_without_inter_stage_payload_does_not_raise() -> Non
 
     OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
 
-    # Nothing to hand downstream: no payload, no segment boundary, not finished.
-    sched.chunk_transfer_adapter.save_async.assert_not_called()
+    if token_only:
+        sched.chunk_transfer_adapter.save_async.assert_called_once_with(
+            None,
+            session,
+            False,
+            new_token_ids=[42],
+            confirmed_num_computed_tokens=None,
+        )
+    else:
+        sched.chunk_transfer_adapter.save_async.assert_not_called()
 
 
 def test_queued_streaming_update_on_async_stop_fences_in_flight_once() -> None:

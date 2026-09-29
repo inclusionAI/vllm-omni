@@ -766,7 +766,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 assert not prompt_logprobs_tensors
 
             if self.chunk_transfer_adapter is not None and (
-                inter_stage_output is not None or is_segment_finished or finished
+                inter_stage_output is not None
+                or is_segment_finished
+                or finished
+                or (
+                    bool(new_token_ids)
+                    and getattr(
+                        self.chunk_transfer_adapter.custom_process_next_stage_input_func,
+                        "_requires_full_token_history",
+                        False,
+                    )
+                )
             ):
                 save_kwargs = {
                     "new_token_ids": new_token_ids,
