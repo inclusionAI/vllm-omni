@@ -22,6 +22,7 @@ _THINKER_STAGE = StagePipelineConfig(
     hf_config_name="text_config",
     engine_output_type="text",
     model_arch="BailingMoeV3AudioForConditionalGeneration",
+    async_chunk_process_next_stage_input_func=f"{_PROC}.thinker2talker_async_chunk",
     sampling_constraints={"detokenize": True},
 )
 

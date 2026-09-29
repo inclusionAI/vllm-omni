@@ -344,7 +344,10 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         runtime_additional_information: list[dict] | None,
     ) -> dict[str, Any]:
         if runtime_additional_information and len(runtime_additional_information) > 0:
-            return runtime_additional_information[0] or {}
+            info = runtime_additional_information[0] or {}
+            # Async chunk transport nests the per-chunk talker inputs in the
+            # structured payload's generic additional_information field.
+            return info.get("additional_information", info)
         return {}
 
     def _resolve_generation_params(self, additional_info: dict[str, Any]) -> _GenerationParams:

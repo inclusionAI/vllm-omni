@@ -38,6 +38,7 @@ from vllm_omni.model_executor.models.ming3_audio.ming3_audio import (
 from vllm_omni.model_executor.models.ming3_audio.processing import ASR_PROMPT
 from vllm_omni.model_executor.models.registry import OmniModelRegistry
 from vllm_omni.model_executor.stage_input_processors.ming3_audio import (
+    thinker2talker_async_chunk,
     thinker2talker_token_only,
 )
 from vllm_omni.transformers_utils.configs.ming3_audio import (
@@ -441,4 +442,50 @@ def test_ming3_pipeline_supports_text_and_audio_outputs():
     assert talker.tokenizer_subdir == "talker/llm"
     assert talker.sync_process_input_func == (
         f"{thinker2talker_token_only.__module__}.{thinker2talker_token_only.__name__}"
+    )
+    assert thinker.async_chunk_process_next_stage_input_func == (
+        f"{thinker2talker_async_chunk.__module__}.{thinker2talker_async_chunk.__name__}"
+    )
+
+
+def test_ming3_async_chunk_emits_stable_sentences_and_terminal_tail(mocker: MockerFixture):
+    tokenizer = mocker.Mock(spec=["decode"])
+    tokenizer.decode.side_effect = lambda ids, **kwargs: "".join(
+        {1: "你好", 2: "。", 3: "世界"}[token_id] for token_id in ids
+    )
+    manager = mocker.Mock(spec=["_ming3_text_tokenizer", "_ming3_chunk_state"])
+    manager._ming3_text_tokenizer = tokenizer
+    manager._ming3_chunk_state = {}
+    request = mocker.Mock(spec=["external_req_id", "prompt_token_ids", "all_token_ids", "additional_information"])
+    request.external_req_id = "r1"
+    request.prompt_token_ids = [99]
+    request.additional_information = {"max_text_length": 42}
+
+    request.all_token_ids = [99, 1]
+    assert thinker2talker_async_chunk(manager, None, request) is None
+    request.all_token_ids = [99, 1, 2]
+    first = thinker2talker_async_chunk(manager, None, request)
+    assert first is not None
+    assert first.additional_information["text"] == "你好。"
+    assert first.additional_information["ming_task"] == "omni"
+    assert first.additional_information["max_text_length"] == 42
+    assert first.codes.audio.tolist() == [0]
+    assert first.meta.replace_runtime_additional_information is True
+    assert thinker2talker_async_chunk(manager, None, request) is None
+
+    request.all_token_ids = [99, 1, 2, 3]
+    final = thinker2talker_async_chunk(manager, None, request, is_finished=True)
+    assert final is not None
+    assert final.additional_information["text"] == "世界"
+    assert manager._ming3_chunk_state == {}
+
+
+def test_ming_talker_reads_async_chunk_metadata():
+    from vllm_omni.model_executor.models.ming_flash_omni.ming_flash_omni_talker import (
+        MingFlashOmniTalkerForConditionalGeneration,
+    )
+
+    info = {"additional_information": {"text": "你好。", "ming_task": "omni"}}
+    assert (
+        MingFlashOmniTalkerForConditionalGeneration._extract_additional_info([info]) == info["additional_information"]
     )

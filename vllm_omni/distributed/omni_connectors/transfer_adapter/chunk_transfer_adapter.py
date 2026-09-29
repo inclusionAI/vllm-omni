@@ -1045,6 +1045,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         """Clear sender state while ``_sender_state_lock`` is held."""
         self.put_req_chunk.pop(external_req_id, None)
         self.request_payload.pop(external_req_id, None)
+        getattr(self, "_ming3_chunk_state", {}).pop(external_req_id, None)
         self.code_prompt_token_ids.pop(external_req_id, None)
         getattr(self, "_qwen3_tts_emitted_frames", {}).pop(external_req_id, None)
         self.requests_num_chunks_sent.pop(external_req_id, None)

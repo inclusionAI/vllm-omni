@@ -315,28 +315,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             reference_sample_rate,
         )
 
-    def _fix_minicpmo45_audio_stream_output_kinds(
+    def _fix_audio_stream_output_kinds(
         self,
         sampling_params_list: list[Any],
         output_modalities: list[str] | tuple[str, ...] | None,
     ) -> list[Any]:
-        """Keep MiniCPM-o 4.5's thinker final-only during audio streaming.
+        """Keep completion-only text handoffs coherent under ``stream=true``.
 
-        Chat ``stream=true`` normally coerces every AR stage to DELTA output.
-        That is correct for token-level text streaming, but MiniCPM-o 4.5's
-        Talker consumes the completed TTS span plus aligned thinker hidden
-        states. If Stage0 is DELTA, llm2tts receives one generated token at a
-        time and repeatedly starts tiny, independent TTS streams. The API then
-        never represents one coherent audio response.
-
-        For this model, stream the audio stage, not the thinker-to-talker
-        boundary.
+        MiniCPM-o and synchronous Ming3 talkers need completed thinker text;
+        the async Ming3 bridge instead consumes the running token stream.
         """
         if not output_modalities or "audio" not in output_modalities:
             return sampling_params_list
-        if not self._has_minicpmo45_stage():
-            return sampling_params_list
-
         stage_configs = getattr(self.engine_client, "stage_configs", []) or []
         for idx, stage in enumerate(stage_configs):
             if idx >= len(sampling_params_list):
@@ -346,13 +336,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 continue
 
             model_arch, model_stage = self._stage_model_metadata(stage)
-            if model_arch != "MiniCPMO45OmniForConditionalGeneration":
-                continue
-
-            if model_stage == "llm":
-                sp.output_kind = RequestOutputKind.FINAL_ONLY
-            elif model_stage == "tts":
-                sp.output_kind = RequestOutputKind.DELTA
+            if model_arch == "MiniCPMO45OmniForConditionalGeneration":
+                if model_stage == "llm":
+                    sp.output_kind = RequestOutputKind.FINAL_ONLY
+                elif model_stage == "tts":
+                    sp.output_kind = RequestOutputKind.DELTA
+            elif model_arch == "BailingMoeV3AudioForConditionalGeneration" and model_stage == "thinker":
+                connector = self._stage_get(stage, "connector_config")
+                if not self._stage_get(connector, "async_chunk", False):
+                    sp.output_kind = RequestOutputKind.FINAL_ONLY
         return sampling_params_list
 
     @classmethod
@@ -870,7 +862,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # convert cumulative to Final Only to ensure the output is correct.
                 sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
                 if request.stream:
-                    sampling_params_list = self._fix_minicpmo45_audio_stream_output_kinds(
+                    sampling_params_list = self._fix_audio_stream_output_kinds(
                         sampling_params_list,
                         output_modalities,
                     )
