@@ -296,6 +296,7 @@ class BailingMoeV3AudioForConditionalGeneration(
             ],
             tokenize=True,
             add_generation_prompt=True,
+            enable_thinking=False,
         )
         return TokensPrompt(
             prompt_token_ids=prompt_token_ids,

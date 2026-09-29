@@ -445,7 +445,7 @@ def thinker2talker_token_only(
     _requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
     """Sync-side builder for the non-async-chunk thinker→talker path."""
-    return build_ming_talker_inputs(source_outputs, prompt, default_voice_name="DB30")
+    return build_ming_talker_inputs(source_outputs, prompt)
 
 
 __all__ = [
