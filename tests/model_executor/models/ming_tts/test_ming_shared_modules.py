@@ -90,10 +90,10 @@ def test_audio_vae_builds_only_requested_components():
     decoder_only = AudioVAE(config, build_encoder=False)
     encoder_only = AudioVAE(config, build_decoder=False)
 
-    assert not hasattr(decoder_only, "encoder")
+    assert decoder_only.encoder is None
     assert all(not name.startswith("encoder.") for name in decoder_only.state_dict())
     assert any(name.startswith("decoder.") for name in decoder_only.state_dict())
-    assert not hasattr(encoder_only, "decoder")
+    assert encoder_only.decoder is None
     assert all(not name.startswith("decoder.") for name in encoder_only.state_dict())
     assert any(name.startswith("encoder.") for name in encoder_only.state_dict())
     with pytest.raises(RuntimeError, match="decoder-only mode"):

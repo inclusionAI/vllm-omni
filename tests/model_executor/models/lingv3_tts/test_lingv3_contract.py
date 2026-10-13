@@ -345,6 +345,7 @@ def test_lingv3_vectorizes_only_compatible_flow_requests():
         torch.arange(12, dtype=torch.float32).reshape(3, 4),
         request_infos,
         [1, 1, 1],
+        [True, True, True],
     )
 
     assert set(results) == {0, 1}
