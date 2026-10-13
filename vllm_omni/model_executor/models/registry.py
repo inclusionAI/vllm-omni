@@ -267,6 +267,22 @@ _OMNI_MODELS = {
         "ming_tts_audio_vae",
         "MingAudioVAEModel",
     ),
+    ## LingV3-TTS
+    "LingV3TTSForConditionalGeneration": (
+        "lingv3_tts",
+        "lingv3_tts",
+        "LingV3TTSForConditionalGeneration",
+    ),
+    "LingV3TTSLLMModel": (
+        "lingv3_tts",
+        "lingv3_tts_llm",
+        "LingV3TTSLLMModel",
+    ),
+    "LingV3TTSAudioVAEModel": (
+        "lingv3_tts",
+        "lingv3_tts_audio_vae",
+        "LingV3TTSAudioVAEModel",
+    ),
     ## glm_image
     "GlmImageForConditionalGeneration": (
         "glm_image",
