@@ -160,7 +160,7 @@ def tiny_processor(tiny_model_config: OmniModelConfig):
         tiny_model_config,
         tokenizer=cached_tokenizer_from_config(tiny_model_config),
     )
-    return BailingMoeV3AudioForConditionalGeneration._processor_factory.build_processor(ctx, cache=None)
+    return BailingMoeV3AudioForConditionalGeneration._processor_factory.build_processor(ctx)
 
 
 @pytest.fixture
