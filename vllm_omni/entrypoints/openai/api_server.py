@@ -1239,6 +1239,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                 detail="The model does not support Chat Completions API",
             )
         return base_server.create_error_response(message="The model does not support Chat Completions API")
+    if request.model == "auto":
+        request.model = None
     try:
         generator = await handler.create_chat_completion(request, raw_request)
     except (EngineGenerateError, EngineDeadError) as exc:
@@ -1376,6 +1378,9 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
             status_code=HTTPStatus.NOT_FOUND,
         )
         return _error_response_to_json_response(err, status_code=HTTPStatus.NOT_FOUND)
+    if request.model == "auto":
+        request.model = None
+
     try:
         result = await handler.create_speech(request, raw_request)
         if isinstance(result, ErrorResponse):
@@ -1414,6 +1419,9 @@ async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request)
             status_code=HTTPStatus.NOT_FOUND,
         )
         return _error_response_to_json_response(err, status_code=HTTPStatus.NOT_FOUND)
+    if request.model == "auto":
+        request.model = None
+
     try:
         result = await handler.create_speech_batch(request)
         if isinstance(result, ErrorResponse):
@@ -2067,6 +2075,9 @@ async def generate_images(
     # Get engine client (AsyncOmni) from app state
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
 
+    if request.model == "auto":
+        request.model = None
+
     if request.model is not None and request.model != model_name:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
@@ -2273,7 +2284,7 @@ async def edit_images(
     url: list[str] | None = Form(None),
     url_array: list[str] | None = Form(None, alias="url[]"),
     prompt: str = Form(...),
-    model: str = Form(None),
+    model: str | None = Form(None),
     n: int = Form(1),
     size: str = Form("auto"),
     response_format: str = Form("b64_json"),
@@ -2312,6 +2323,8 @@ async def edit_images(
     # 1. get engine and model
     request_timestamp = float(getattr(raw_request.state, "request_timestamp", time.time()))
     engine_client, model_name, stage_configs = _get_engine_and_model(raw_request)
+    if model == "auto":
+        model = None
     if model is not None and model != model_name:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST.value,
