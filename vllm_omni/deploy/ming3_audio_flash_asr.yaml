@@ -1,0 +1,47 @@
+# Ming-3.0-audio-flash: audio understanding plus optional speech output.
+#
+# Stage 0 runs TP=4 across GPUs 0-3. Stage 1 reuses the last GPU for the
+# self-contained Qwen2 + CFM + AudioVAE talker. Use the thinker-only profile
+# when only ASR / Speech-QA text is required.
+pipeline: bailing_moe_v3_audio
+async_chunk: false
+trust_remote_code: false
+distributed_executor_backend: mp
+dtype: bfloat16
+enable_prefix_caching: false
+enable_chunked_prefill: true
+
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3"
+    tensor_parallel_size: 4
+    enable_expert_parallel: false
+    disable_custom_all_reduce: true
+    logits_processors:
+      - vllm_omni.model_executor.logits_processor:NoRepeatNGramLogitsProcessor
+    max_num_seqs: 1
+    max_model_len: 8192
+    max_num_batched_tokens: 2048
+    gpu_memory_utilization: 0.78
+    enforce_eager: true
+    async_scheduling: false
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 256
+      detokenize: true
+      ignore_eos: false
+
+  - stage_id: 1
+    devices: "3"
+    max_num_seqs: 1
+    max_num_batched_tokens: 8192
+    gpu_memory_utilization: 0.18
+    enforce_eager: true
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 1
+
+# Native CUDA Bailing/KDA kernels are required.
+platforms: {}
