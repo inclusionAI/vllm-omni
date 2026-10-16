@@ -7,9 +7,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from functools import cached_property
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import soundfile as sf
@@ -56,6 +58,126 @@ class VoicePresetRegistry:
         self._patch_size = patch_size
 
         self.registered: dict[str, dict[str, Any]] = {}
+        self._reference_cache: dict[tuple, dict[str, Any]] = {}
+        self._antoc_cache_hits = 0
+
+    def _load_antoc_reference_cache(
+        self,
+        paths: list[str],
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        need_speaker: bool,
+        need_latents: bool,
+    ) -> dict[str, Any] | None:
+        """Read AntOC's seed-1234 prompt features without recomputing the VAE posterior."""
+        cache_root = os.environ.get("MING_TTS_ANTOC_PROMPT_CACHE_DIR")
+        if not cache_root:
+            return None
+        key = hashlib.md5("|".join(paths).encode()).hexdigest()[:16]
+        cache_path = Path(cache_root) / f"{key}.pt"
+        if not cache_path.is_file():
+            raise FileNotFoundError(f"AntOC prompt cache entry missing: {cache_path}")
+        payload = torch.load(cache_path, map_location="cpu", weights_only=True)
+        if not isinstance(payload, dict):
+            raise ValueError(f"Invalid AntOC prompt cache entry: {cache_path}")
+
+        latents = projected = None
+        if need_latents:
+            latents = payload.get("prompt_wav_lat")
+            if (
+                not isinstance(latents, torch.Tensor)
+                or latents.ndim != 3
+                or latents.shape[0] != 1
+                or latents.shape[-1] != self._audio_vae.config.dec_kwargs["latent_dim"]
+                or latents.shape[1] % self._patch_size
+                or not torch.isfinite(latents).all()
+            ):
+                raise ValueError(f"Invalid AntOC prompt latent: {cache_path}")
+            latents = latents.to(device=device, dtype=dtype)
+            patches = latents.reshape(-1, self._patch_size, latents.shape[-1])
+            projected = self._aggregator(patches).reshape(1, -1, self._spk_head.out_features)
+
+        embeddings = []
+        if need_speaker:
+            raw_speakers = payload.get("raw_se")
+            if not isinstance(raw_speakers, list) or len(raw_speakers) != len(paths):
+                raise ValueError(f"Invalid AntOC speaker cache entry: {cache_path}")
+            for raw in raw_speakers:
+                if (
+                    not isinstance(raw, torch.Tensor)
+                    or raw.shape != (1, self._spk_head.in_features)
+                    or not torch.isfinite(raw).all()
+                ):
+                    raise ValueError(f"Invalid AntOC speaker embedding: {cache_path}")
+                embeddings.append(self._spk_head(raw.to(device=device, dtype=dtype)))
+        self._antoc_cache_hits += 1
+        if self._antoc_cache_hits == 1:
+            logger.info("Reading AntOC prompt features from %s", cache_root)
+        return {"spk_emb": embeddings, "prompt_wav_lat": latents, "prompt_wav_emb": projected}
+
+    @torch.no_grad()
+    def resolve_reference(
+        self,
+        prompt_wav_path: str | list[str] | None,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        need_speaker: bool,
+        need_latents: bool,
+        reference_audio: list[dict] | None = None,
+    ) -> dict[str, Any]:
+        """Resolve AntOC reference audio, extracting only the requested features."""
+        from torchaudio.functional import resample as resample_reference
+
+        cache_key = None
+        if prompt_wav_path:
+            paths = self._normalize_paths("request", prompt_wav_path)
+            cache_key = (tuple((p, os.stat(p).st_mtime_ns) for p in paths), need_speaker, need_latents)
+            if cache_key in self._reference_cache:
+                return self._reference_cache[cache_key]
+            cached = self._load_antoc_reference_cache(
+                paths, device=device, dtype=dtype, need_speaker=need_speaker, need_latents=need_latents
+            )
+            if cached is not None:
+                if len(self._reference_cache) >= 16:
+                    self._reference_cache.pop(next(iter(self._reference_cache)))
+                self._reference_cache[cache_key] = cached
+                return cached
+            reference_audio = []
+            for path in paths:
+                data, sr = sf.read(path, dtype="float32")
+                if data.ndim == 2:
+                    data = data.mean(axis=1)
+                reference_audio.append({"samples": data, "sample_rate": sr})
+        if not reference_audio:
+            raise ValueError("Reference audio is missing")
+        speech = []
+        embeddings = []
+        for item in reference_audio:
+            waveform = torch.as_tensor(item["samples"], dtype=torch.float32).reshape(1, -1)
+            sr = int(item["sample_rate"])
+            if sr <= 0 or waveform.numel() == 0 or not torch.isfinite(waveform).all():
+                raise ValueError("Reference audio must be finite, nonempty, and have a positive sample rate")
+            if need_speaker:
+                raw = self._spkemb_extractor(resample_reference(waveform, sr, 16000))
+                if raw is None:
+                    raise ValueError("CAMPPlus did not produce a reference speaker embedding")
+                embeddings.append(self._spk_head(raw.to(device=device, dtype=dtype)))
+            if need_latents:
+                if self._audio_vae is None:
+                    raise RuntimeError("Reference continuation requires AudioVAE")
+                speech.append(resample_reference(waveform, sr, int(self._audio_vae.config.sample_rate)))
+        latents, projected = None, None
+        if need_latents:
+            latents, projected = self._build_wav_embeddings("request", torch.cat(speech, dim=-1), device=device)
+        resolved = {"spk_emb": embeddings, "prompt_wav_lat": latents, "prompt_wav_emb": projected}
+        if cache_key is not None:
+            # Bound retained GPU reference features for long evaluation jobs.
+            if len(self._reference_cache) >= 16:
+                self._reference_cache.pop(next(iter(self._reference_cache)))
+            self._reference_cache[cache_key] = resolved
+        return resolved
 
     def __contains__(self, voice_name: str) -> bool:
         return voice_name in self.registered
@@ -258,6 +380,7 @@ class VoicePresetRegistry:
         prompt_wav_lat, _ = self._audio_vae.encode_latent(
             speech.to(dtype=torch.bfloat16, device=device),
             torch.tensor([speech.size(1)], dtype=torch.long, device=device),
+            generator=torch.Generator(device=device).manual_seed(1234),
         )
         assert prompt_wav_lat.shape[1] % self._patch_size == 0, (
             f"AudioVAE latent length is incompatible with patch_size for voice preset '{voice_name}'"

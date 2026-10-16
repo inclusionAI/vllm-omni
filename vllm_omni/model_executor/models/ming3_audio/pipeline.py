@@ -35,7 +35,8 @@ _TALKER_STAGE = StagePipelineConfig(
     final_output=True,
     final_output_type="audio",
     engine_output_type="audio",
-    tokenizer_subdir="talker/llm",
+    tokenizer_subdir="llm",
+    model_path_resolver="vllm_omni.model_executor.models.ming_flash_omni.checkpoint.resolve_ming_talker_checkpoint",
     sync_process_input_func=f"{_PROC}.thinker2talker_token_only",
 )
 

@@ -35,6 +35,11 @@ classifiers = [
 
 [project.optional-dependencies]
 
+ming-tn = [
+    "pynini",
+    "inflect",
+]
+
 dev = [
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
@@ -165,6 +170,8 @@ include = ["vllm_omni*"]
 
 [tool.setuptools.package-data]
 "vllm_omni" = ["_version.py", "py.typed", "transformers_utils/chat_templates/*.jinja"]
+"vllm_omni.model_executor.models.ming_flash_omni" = ["data/*.json", "data/*.wav"]
+"vllm_omni.model_executor.models.ming_flash_omni.talker_tn" = ["*.fst", "talker_re.json"]
 
 [tool.setuptools_scm]
 # no extra settings needed, presence enables setuptools-scm

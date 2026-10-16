@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Ming-flash-omni-2.0 pipeline topology (frozen).
 
 Stage 0: Thinker — multimodal understanding + text generation.
@@ -78,9 +78,9 @@ MING_FLASH_OMNI_TTS_PIPELINE = PipelineConfig(
             final_output=True,
             final_output_type="audio",
             owns_tokenizer=True,
-            hf_config_name="talker_config",
             engine_output_type="audio",
-            tokenizer_subdir="talker/llm",
+            tokenizer_subdir="llm",
+            model_path_resolver="vllm_omni.model_executor.models.ming_flash_omni.checkpoint.resolve_ming_talker_checkpoint",
         ),
     ),
 )

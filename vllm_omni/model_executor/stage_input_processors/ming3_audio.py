@@ -13,9 +13,14 @@ from vllm.tokenizers import cached_tokenizer_from_config
 
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.engine import OmniEngineCoreRequest
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.inputs.data import OmniTokensPrompt
 
-from .ming_talker import build_ming_talker_additional_info, build_ming_talker_inputs
+from .ming_talker import (
+    build_ming_talker_additional_info,
+    build_ming_talker_inputs,
+    strip_language_tag,
+)
 
 
 def thinker2talker_token_only(
@@ -28,13 +33,23 @@ def thinker2talker_token_only(
 
 
 _SENTENCE_END = re.compile(r"[。！？!?]|(?<!\d)\.(?!\d)")
+_PROTECTED_SENTENCE_TEXT = re.compile(
+    r"https?://[^\s。！？]+|\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr)\.|\b(?:[A-Za-z]\.)+[A-Za-z]?",
+    re.IGNORECASE,
+)
 _CLOSING_PUNCTUATION = frozenset("\"'”’）】")
 
 
 def _ready_sentence_end(text: str, start: int) -> int | None:
     """Return the last stable sentence boundary after ``start``."""
     end = None
+    protected = list(_PROTECTED_SENTENCE_TEXT.finditer(text))
     for match in _SENTENCE_END.finditer(text, start):
+        if any(span.start() <= match.start() < span.end() for span in protected):
+            continue
+        # The next token may turn a trailing period into an abbreviation or URL.
+        if match.group() == "." and match.end() == len(text):
+            continue
         end = match.end()
         while end < len(text) and text[end] in _CLOSING_PUNCTUATION:
             end += 1
@@ -77,17 +92,24 @@ def thinker2talker_async_chunk(
     end = len(text) if is_finished else _ready_sentence_end(text, len(state))
     if end is None:
         return None
-    chunk = text[len(state) : end].strip()
+    chunk = text[len(state) : end]
     states[request_id] = text[:end]
     if is_finished:
         states.pop(request_id, None)
+    # The transcribe-format thinker prefixes its stream with a `<lang>\t`
+    # tag (metadata for text responses). Strip it from the first chunk only
+    # after the raw prefix-consistency state above has been advanced, so it
+    # is never read aloud while `text.startswith(state)` stays intact.
+    chunk = strip_language_tag(chunk.lstrip()).strip()
     if not chunk:
         return None
 
     return OmniPayloadStruct(
         # The generation runner needs a nonempty prompt to execute this chunk.
         codes=CodesStruct(audio=torch.tensor([0], dtype=torch.long)),
-        additional_information=build_ming_talker_additional_info(chunk, request.additional_information),
+        additional_information=build_ming_talker_additional_info(
+            chunk, deserialize_additional_information(request.additional_information)
+        ),
         meta=MetaStruct(replace_runtime_additional_information=True),
     )
 

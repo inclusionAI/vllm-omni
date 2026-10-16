@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import torch
 import torch.nn as nn
@@ -326,7 +326,7 @@ class AudioVAE(PreTrainedModel):
                 module.weight.data[module.padding_idx].zero_()
 
     @torch.inference_mode()
-    def encode_latent(self, waveform, waveform_length):
+    def encode_latent(self, waveform, waveform_length, generator=None):
         if waveform.ndim != 2:
             raise ValueError(f"Expected waveform rank-2 [Batch, Time], got {tuple(waveform.shape)}")
         if waveform_length.ndim != 1:
@@ -348,7 +348,8 @@ class AudioVAE(PreTrainedModel):
 
         mean, scale = torch.chunk(h, 2, dim=1)
         std = F.softplus(scale) + 1e-4
-        latent = (mean + std * torch.randn_like(mean)).transpose(1, 2)
+        noise = torch.randn(mean.shape, device=mean.device, dtype=mean.dtype, generator=generator)
+        latent = (mean + std * noise).transpose(1, 2)
         return latent, frame_num
 
     @torch.inference_mode()

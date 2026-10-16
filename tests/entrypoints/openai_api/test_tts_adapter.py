@@ -6,6 +6,8 @@ Pure-Python registry/resolution logic; no model or GPU resources are loaded.
 """
 
 import asyncio
+import base64
+import json
 from types import SimpleNamespace
 from typing import Any
 
@@ -421,8 +423,41 @@ def test_ming_flash_omni_build_constructs_prepared_request():
     info = prepared.prompt["additional_information"]
     assert info["ming_task"] == "instruct"
     assert info["text"] == "hello"
-    assert info["voice_name"] == "test"
+    assert info["voice_name"] is None
+    assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] == "test"
+    assert info["speaker_conditioning"] == "mute"
+    assert info["prompt_audio_mode"] == "none"
     assert prepared.model_type == "ming_flash_omni_tts"
+
+
+def test_ming_flash_omni_build_passes_base64_reference_audio():
+    class FakeServer:
+        uploaded_speakers = {}
+
+        async def _resolve_ref_audio(self, uri):
+            self.uri = uri
+            return [0.1, -0.1], 16000, "cache-key"
+
+    server = FakeServer()
+    adapter = MingFlashOmniTTSAdapter(SimpleNamespace(server=server, engine_client=SimpleNamespace()))
+    encoded = base64.b64encode(b"RIFFfakeWAVE").decode()
+    request = OpenAICreateSpeechRequest(input="hello", ref_audio=encoded)
+
+    assert adapter.validate(request) is None
+    prepared = asyncio.run(adapter.build(request, [], True))
+
+    assert server.uri == f"data:audio/wav;base64,{encoded}"
+    info = prepared.prompt["additional_information"]
+    assert info["reference_audio"] == [{"samples": [0.1, -0.1], "sample_rate": 16000}]
+    assert info["speaker_conditioning"] == "prompt"
+    assert info["prompt_audio_mode"] == "speaker_only"
+    assert info["instruction"] is None
+
+
+def test_ming_flash_omni_rejects_mixed_ip_and_reference():
+    adapter = MingFlashOmniTTSAdapter(SimpleNamespace(server=SimpleNamespace(), engine_client=SimpleNamespace()))
+    request = OpenAICreateSpeechRequest(input="hello", voice="灵小柔", ref_audio="data:audio/wav;base64,AA==")
+    assert "either" in adapter.validate(request)
 
 
 def test_step_audio2_build_constructs_open_assistant_turn():

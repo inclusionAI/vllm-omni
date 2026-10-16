@@ -39,6 +39,7 @@ from vllm_omni.entrypoints.openai.protocol.chat_completion import (
     OmniChatCompletionResponseChoice,
     OmniChatCompletionResponseStreamChoice,
 )
+from vllm_omni.entrypoints.openai.reference_audio import reference_audio_uri
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 from vllm_omni.metrics import definitions as _metric_defs
@@ -272,6 +273,40 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if model_arch == "MiniCPMO45OmniForConditionalGeneration":
                 return True
         return False
+
+    def _has_ming3_talker_stage(self) -> bool:
+        stages = getattr(self.engine_client, "stage_configs", []) or []
+        metadata = [self._stage_model_metadata(stage) for stage in stages]
+        return any(arch == "BailingMoeV3AudioForConditionalGeneration" for arch, _ in metadata) and any(
+            model_stage == "ming_tts" for _, model_stage in metadata
+        )
+
+    async def _attach_ming3_reference_audio(self, engine_prompt: TokPrompt) -> None:
+        """Decode a chat request's base64 ref_audio before the Talker handoff."""
+        if not self._has_ming3_talker_stage():
+            return
+        info = engine_prompt.get("additional_information")
+        if not isinstance(info, dict) or "ref_audio" not in info:
+            return
+        if info.get("voice_mode") == "ip" or info.get("ip_name") or info.get("voice_name"):
+            raise ValueError("Choose either an IP voice or ref_audio for voice cloning")
+        sources = info["ref_audio"]
+        if isinstance(sources, str):
+            sources = [sources]
+        if not isinstance(sources, list) or not sources or not all(isinstance(source, str) for source in sources):
+            raise ValueError("ref_audio must be a base64 audio string or a nonempty list of them")
+        config = self.model_config
+        connector = MediaConnector(
+            allowed_local_media_path=getattr(config, "allowed_local_media_path", "") or "",
+            allowed_media_domains=getattr(config, "allowed_media_domains", None),
+        )
+        references = []
+        for source in sources:
+            waveform, sample_rate = await connector.fetch_audio_async(reference_audio_uri(source))
+            references.append({"samples": waveform.tolist(), "sample_rate": sample_rate})
+        info.pop("ref_audio")
+        info["reference_audio"] = references
+        info["voice_mode"] = "reference"
 
     async def _attach_minicpmo45_reference_audio(
         self,
@@ -996,6 +1031,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             prompt_additional_information["deferred_multi_modal_data"] = deferred_multi_modal_data
 
         await self._attach_minicpmo45_reference_audio(engine_prompt, request)
+        await self._attach_ming3_reference_audio(engine_prompt)
 
         speaker = getattr(request, "voice", None) or getattr(request, "speaker", None)
         normalized = validate_requested_speaker(speaker, self._get_supported_speakers())

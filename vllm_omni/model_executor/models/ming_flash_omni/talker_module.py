@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The vLLM-Omni team.
 # Copyright (c) Ant Group. All rights reserved.
 # Ported from:
@@ -361,7 +362,7 @@ def trim_trailing_silence(
     sil_th: float = 1e-3,
     tail_silence_s: float = 0.3,
 ) -> torch.Tensor:
-    """Trim low-energy tail while keeping a short trailing silence.
+    """Apply native Ming's final-chunk silence holder to a full waveform.
 
     Works on 2-D ``(channels, samples)`` or 3-D ``(batch, channels, samples)``
     tensors. Any other shape is returned unchanged.
@@ -377,28 +378,7 @@ def trim_trailing_silence(
     else:
         return waveform
 
-    frame_step = int(sample_rate * 0.1)
-    frame_size = int(sample_rate * 0.1)
-    if speech.shape[-1] < frame_size:
-        keep = min(speech.shape[-1], int(tail_silence_s * sample_rate))
-        trimmed = speech[..., :keep]
-    else:
-        num_frame = (speech.shape[-1] - frame_size) // frame_step + 1
-        cur_len = (num_frame - 1) * frame_step + frame_size
-        speech = speech[..., :cur_len]
-        spe_frames = speech.unfold(-1, frame_size, frame_step)
-        scores = spe_frames.abs().mean(dim=-1)
-        scores = scores.mean(dim=list(range(scores.dim() - 1)))
-        idx = scores.shape[0] - 1
-        while idx >= 0 and scores[idx] <= sil_th:
-            idx -= 1
-        if idx < 0:
-            keep = min(speech.shape[-1], int(tail_silence_s * sample_rate))
-            trimmed = speech[..., :keep]
-        else:
-            non_sil_len = idx * frame_step + frame_size + int(tail_silence_s * sample_rate)
-            non_sil_len = min(non_sil_len, speech.shape[-1])
-            trimmed = speech[..., :non_sil_len]
+    trimmed, _ = silence_holder(speech, sample_rate, last_chunk=True, sil_th=sil_th, last_sil=tail_silence_s)
 
     if original_dim == 3:
         return trimmed.unsqueeze(1)
@@ -617,10 +597,7 @@ class MingAudioGenerator:
         self.cfg_strength = cfg_strength
 
         self._use_cuda_graphs = use_cuda_graphs
-
-        # For FA2, let it see a full-length seq Q
-        # trailing latent frames prepended on each decode call
-        self._vae_decode_pad_frames = 32
+        self._max_cache_len = int(getattr(config, "max_cache_len", self._STATIC_CACHE_LEN))
 
     def model_local_kv_specs(self) -> list[ModelLocalKVSpec]:
         """Declare the talker's preallocated decode cache.
@@ -655,12 +632,12 @@ class MingAudioGenerator:
                 self._llm_config,
                 name="talker_llm_static_cache",
                 dtype=next(self._model.parameters()).dtype,
-                physical_capacity_positions=self._STATIC_CACHE_LEN,
-                capacity_source=f"hardcoded max_cache_len={self._STATIC_CACHE_LEN} in _init_kv_cache",
-                scope=ModelLocalKVScope.INVOCATION,
+                physical_capacity_positions=self._max_cache_len,
+                capacity_source=f"talker config max_cache_len={self._max_cache_len}",
+                scope=ModelLocalKVScope.REQUEST,
                 rows=RowDriver.FIXED,
                 rows_fixed=1,
-                rows_reason="forward() handles one request and runs the AR loop inline",
+                rows_reason="one active Talker request per worker, including background streaming generation",
                 allocation_note="full extent on first write per layer, not grown; rebuilt per text segment",
             )
         ]
@@ -695,12 +672,14 @@ class MingAudioGenerator:
         inputs_embeds: torch.Tensor,
         *,
         prompt_wav_lat: torch.Tensor | None = None,
-        min_new_token: int = 10,
+        min_new_token: int = 3,
         max_steps: int = 1000,
         cfg: float | None = None,
         sigma: float = 0.25,
         temperature: float = 0.0,
         use_static_cache: bool = True,
+        stop_threshold: float = 0.5,
+        on_latent=None,
     ) -> list[torch.Tensor]:
         """Autoregressive LLM + CFM sampling loop"""
         if cfg is None:
@@ -711,6 +690,8 @@ class MingAudioGenerator:
         his_lat = self._init_his_lat(prompt_wav_lat, device, dtype)
         past_key_values, max_cache_len = self._init_kv_cache(use_static_cache, device, dtype)
         prefill_len = inputs_embeds.shape[1]
+        if prefill_len >= max_cache_len:
+            raise ValueError(f"TTS prompt has {prefill_len} positions, exceeding cache limit {max_cache_len}")
         all_latents: list[torch.Tensor] = []
 
         for step in range(min(max_steps, max_cache_len - prefill_len)):
@@ -739,7 +720,11 @@ class MingAudioGenerator:
                         inputs_embeds.float().norm().item(),
                     )
 
-            if step > min_new_token and stop_prob > 0.5:
+            stopped = step > min_new_token and stop_prob > stop_threshold
+            last = stopped or step + 1 == min(max_steps, max_cache_len - prefill_len)
+            if on_latent is not None:
+                on_latent(gen_lat, last)
+            if stopped:
                 logger.debug("Stopping at step %d with stop_prob=%.4f", step, stop_prob)
                 break
 
@@ -846,7 +831,7 @@ class MingAudioGenerator:
     def _init_kv_cache(
         self, use_static_cache: bool, device: torch.device, dtype: torch.dtype
     ) -> tuple[StaticCache | None, int]:
-        max_cache_len = self._STATIC_CACHE_LEN
+        max_cache_len = self._max_cache_len
         if not use_static_cache:
             return None, max_cache_len
         cache = StaticCache(
@@ -867,51 +852,34 @@ class MingAudioGenerator:
 
     # VAE streaming decode
     def _stream_decode(self, latents: list[torch.Tensor]) -> torch.Tensor:
-        sr = int(self._audio_vae.config.sample_rate)
-        decode_pad: torch.Tensor | None = None
-        sil_cache: dict | None = None
+        """Decode new latents with request-local VAE and overlap-add state.
+
+        The upsampler holds the first chunk until the next chunk supplies
+        its right context. Only the final call flushes that pending chunk
+        and the ISTFT overlap. This still returns one accumulated waveform;
+        it does not enable streaming transport to the client.
+        """
+        past_key_values = None
+        stream_state = (None, None, None)
         wav_chunks: list[torch.Tensor] = []
 
         for i, lat in enumerate(latents):
             last_chunk = i == (len(latents) - 1)
-
-            if decode_pad is not None:
-                vae_input = torch.cat([decode_pad, lat], dim=1)
-                pad_frames = decode_pad.shape[1]
-            else:
-                vae_input = lat
-                pad_frames = 0
-
-            # Stateless, no KV cache accum intentionally.
-            speech, _, _ = self._audio_vae.decode(
-                vae_input,
-                use_cache=False,
-                stream_state=(None, None, None),
-                last_chunk=True,
-            )
-
-            total_frames = vae_input.shape[1]
-            dcs = speech.shape[-1] // total_frames
-
-            # keep only the new audio.
-            speech_chunk = speech[:, :, pad_frames * dcs :][0].detach().float()
-            speech_chunk, sil_cache = silence_holder(
-                speech_chunk,
-                sr,
-                sil_cache=sil_cache,
+            speech, stream_state, past_key_values = self._audio_vae.decode(
+                lat,
+                past_key_values=past_key_values,
+                use_cache=True,
+                stream_state=stream_state,
                 last_chunk=last_chunk,
             )
-            if speech_chunk.numel() > 0:
-                wav_chunks.append(speech_chunk)
-
-            # Advance the sliding buffer
-            decode_pad = vae_input[:, -self._vae_decode_pad_frames :, :].detach()
+            if speech.numel() > 0:
+                wav_chunks.append(speech.detach().float())
 
         if not wav_chunks:
             device = next(self._model.parameters()).device
             dtype = next(self._model.parameters()).dtype
             return torch.zeros((1, 1, 0), device=device, dtype=dtype)
-        return torch.cat(wav_chunks, dim=-1).unsqueeze(0)
+        return torch.cat(wav_chunks, dim=-1)
 
     # Post-decode helper
     def trim_trailing_silence(self, waveform: torch.Tensor) -> torch.Tensor:

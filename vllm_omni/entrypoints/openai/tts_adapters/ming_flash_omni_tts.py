@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from vllm.inputs import tokens_input
 from vllm.logger import init_logger
 
+from vllm_omni.entrypoints.openai.reference_audio import reference_audio_uri
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
 from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import parse_ming_instruction_fields
@@ -19,9 +20,7 @@ logger = init_logger(__name__)
 
 @register_tts_adapter
 class MingFlashOmniTTSAdapter(ARTTSAdapter):
-    # Ming-flash-omni drives speaker selection via the caption JSON
-    # (audio_sequence[0]["说话人"]) rather than a spk_id table, so there
-    # is no static speaker list to surface here.
+    # IP names are caption controls; clone references arrive with each request.
     stage_keys = frozenset({"ming_tts"})
     name = "ming_flash_omni_tts"
 
@@ -38,24 +37,28 @@ class MingFlashOmniTTSAdapter(ARTTSAdapter):
 
         if request.task_type is not None:
             return "'task_type' is not supported for Ming-flash-omni TTS"
-        if request.language is not None:
-            return "'language' is not supported for Ming-flash-omni TTS (language is inferred from input text)"
-        if request.x_vector_only_mode is not None:
-            return "'x_vector_only_mode' is not supported for Ming-flash-omni TTS"
         if request.initial_codec_chunk_frames is not None:
             return "'initial_codec_chunk_frames' is not supported for Ming-flash-omni TTS"
+        if request.voice and request.ref_audio is not None:
+            return "Choose either an IP voice or ref_audio for voice cloning"
+        if request.ref_text is not None and request.ref_audio is None:
+            return "ref_text requires ref_audio"
+        if not request.voice and request.ref_audio is None and request.speaker_embedding is None:
+            return "Provide an IP voice or ref_audio for voice cloning"
 
-        # Per-request voice cloning from raw audio is not yet wired up: Ming
-        # extracts spk_emb / prompt_wav_lat / prompt_wav_emb model-side via
-        # register_prompt_wav() at engine init. For ad-hoc cloning, callers
-        # should pre-compute speaker_embedding and pass it directly.
-        if request.ref_audio is not None:
-            return (
-                "'ref_audio' is not yet supported for Ming-flash-omni TTS; "
-                "use a preset 'voice' or 'speaker_embedding' instead"
-            )
-        if request.ref_text is not None:
-            return "'ref_text' is not yet supported for Ming-flash-omni TTS"
+        if request.speaker_embedding is not None:
+            vectors = request.speaker_embedding
+            if vectors and isinstance(vectors[0], int | float):
+                vectors = [vectors]
+            if not vectors or any(len(vector) != 192 for vector in vectors):
+                return "Ming speaker embeddings must contain 192 values per speaker"
+        if (
+            request.x_vector_only_mode
+            and request.ref_audio is None
+            and request.speaker_embedding is None
+            and not request.voice
+        ):
+            return "x_vector_only_mode requires reference audio or speaker embeddings"
 
         if request.max_new_tokens is not None and request.max_new_tokens <= 0:
             return "'max_new_tokens' must be a positive integer"
@@ -73,22 +76,49 @@ class MingFlashOmniTTSAdapter(ARTTSAdapter):
         server = self.ctx.server
         # ``instructions`` accepts either plain style text or a JSON object.
         # Unknown caption keys are filtered by ``create_instruction``.
-        caption_fields = parse_ming_instruction_fields(server, request) or {}
+        caption_fields = parse_ming_instruction_fields(server, request, include_voice=False) or {}
+        if request.voice:
+            caption_fields["IP"] = request.voice
         has_spk_emb = request.speaker_embedding is not None
-        # Standalone TTS uses the Ming ``instruct`` task. ``voice_name`` lets
-        # the talker resolve registered presets such as DB30.
+        reference_audio = None
+        if isinstance(request.ref_audio, list):
+            references = await server._resolve_ref_audio_many([reference_audio_uri(uri) for uri in request.ref_audio])
+            reference_audio = [{"samples": samples, "sample_rate": sr} for samples, sr in references]
+        elif request.ref_audio is not None:
+            samples, sr, _ = await server._resolve_ref_audio(reference_audio_uri(request.ref_audio))
+            reference_audio = [{"samples": samples, "sample_rate": sr}]
+        has_reference = has_spk_emb or bool(reference_audio)
+        audio_mode = (
+            ("speaker_only" if request.x_vector_only_mode or request.ref_text is None else "continuation")
+            if has_reference
+            else "none"
+        )
+        prompt_text = DEFAULT_PROMPT
+        if request.language:
+            language = {"zh": "Chinese", "en": "English"}.get(request.language.lower(), request.language)
+            prompt_text += f"Target language: {language}.\n"
+        # Standalone TTS uses the Ming ``instruct`` task. No model data/ preset
+        # is loaded: a voice is an IP caption, or ref_audio supplies conditioning.
         info = {
             "ming_task": "instruct",
-            "prompt": DEFAULT_PROMPT,
+            "prompt": prompt_text,
             "text": request.input,
-            "instruction": create_instruction(caption_fields),
-            "voice_name": request.voice or None,
+            "instruction": create_instruction(caption_fields or None),
+            "voice_name": None,
+            "prompt_text": request.ref_text,
+            "prompt_audio_mode": audio_mode,
+            "speaker_conditioning": "prompt" if has_reference else "mute",
             "use_zero_spk_emb": not has_spk_emb,
-            "max_decode_steps": request.max_new_tokens or self.max_new_tokens_max,
             "cfg": 2.0,
             "sigma": 0.25,
             "temperature": 0.0,
         }
+        if reference_audio:
+            info["reference_audio"] = reference_audio
+        if request.max_new_tokens is not None:
+            info["max_decode_steps"] = request.max_new_tokens
+        if request.seed is not None:
+            info["seed"] = request.seed
         if has_spk_emb:
             # Keep embeddings as plain floats for EngineCore serialization.
             info["spk_emb"] = list(request.speaker_embedding)
@@ -97,5 +127,5 @@ class MingFlashOmniTTSAdapter(ARTTSAdapter):
         return PreparedRequest(prompt=prompt, tts_params={}, model_type="ming_flash_omni_tts")
 
     def _load_supported_speakers(self) -> list[str]:
-        # Speaker selection is driven by caption JSON rather than a static table.
+        # IP names are free-form caption values, not registered voice presets.
         return []

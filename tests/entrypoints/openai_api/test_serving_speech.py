@@ -5155,11 +5155,10 @@ class TestMingFlashOmniTTSServing:
         assert error is not None
         assert "ref_text" in error
 
-    def test_validate_ming_flash_omni_tts_rejects_ref_audio(self, ming_flash_omni_tts_server):
+    def test_validate_ming_flash_omni_tts_accepts_ref_audio(self, ming_flash_omni_tts_server):
         request = OpenAICreateSpeechRequest(input="Hello", ref_audio="data:audio/wav;base64,abc")
         error = ming_flash_omni_tts_server._validate_tts_request(request)
-        assert error is not None
-        assert "ref_audio" in error
+        assert error is None
 
     def test_ming_flash_omni_tts_adapter_builds_prompt(self, ming_flash_omni_tts_server):
         request = OpenAICreateSpeechRequest(input="Hello", voice="test")
@@ -5168,7 +5167,8 @@ class TestMingFlashOmniTTSServing:
         prompt = ming_flash_omni_tts_server.engine_client.generate.call_args.kwargs["prompt"]
         assert prompt["prompt_token_ids"] == [0]
         assert prompt["additional_information"]["text"] == "Hello"
-        assert prompt["additional_information"]["voice_name"] == "test"
+        assert prompt["additional_information"]["voice_name"] is None
+        assert json.loads(prompt["additional_information"]["instruction"])["audio_sequence"][0]["IP"] == "test"
 
 
 class TestTTSAsyncOffloading:

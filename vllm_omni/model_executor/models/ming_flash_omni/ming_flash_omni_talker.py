@@ -31,30 +31,16 @@ from vllm_omni.model_executor.models.common.ming.aggregator import Aggregator
 from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE, AudioVAEConfig
 from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.transformers_utils.configs.ming_flash_omni import MingFlashOmniTalkerConfig
+from vllm_omni.transformers_utils.configs.ming_talker import MingFlashOmniTalkerConfig
 
-from .prompt_utils import DEFAULT_PROMPT as MING_DEFAULT_PROMPT
+from .streaming import MingStreamingJob
 from .talker_module import CFM, DiT, MingAudioGenerator, build_tts_input
 from .text_processing import segment_and_normalize
+from .tts_request import GenerationParams as _GenerationParams
+from .tts_request import resolve_conditioning_modes, resolve_generation_params
 from .voice_presets import VoicePresetRegistry
 
 logger = init_logger(__name__)
-
-
-@dataclass(slots=True)
-class _GenerationParams:
-    """Resolved sampling / decoding parameters for one forward call."""
-
-    prompt: str
-    instruction: str | None
-    cfg: float
-    sigma: float
-    temperature: float
-    max_steps: int
-    use_zero_spk_emb: bool
-    max_text_length: int
-    use_static_cache: bool
-    stream_decode: bool
 
 
 @dataclass(slots=True)
@@ -76,11 +62,14 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
     AudioVAE decodes latents to waveforms.
     """
 
+    requires_request_ids = True
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.have_multimodal_outputs = True
         self.has_preprocess = False
         self.has_postprocess = False
+        self._stream_jobs: dict[str, MingStreamingJob] = {}
 
         self.vllm_config = vllm_config
         root_config = vllm_config.model_config.hf_config
@@ -103,7 +92,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
 
         self._standalone = prefix in ("", "talker")
         if self._standalone:
-            self.allow_patterns_overrides = ["talker/model*.safetensors"]
+            self.allow_patterns_overrides = ["model*.safetensors", "talker/model*.safetensors"]
             self.fall_back_to_pt_during_load = False
 
         # LLM
@@ -118,13 +107,15 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
 
         self.model = Qwen2Model(llm_config)
         self.cfm = CFM(
-            DiT(llm_input_dim=self.hidden_size, **config.flowmodel),
+            DiT(
+                llm_cond_dim=self.hidden_size, **{"native_attention": config.strict_weight_loading, **config.flowmodel}
+            ),
             steps=config.steps,
         )
         # config.aggregator still wins `in_channels` if the checkpoint states it.
         self.aggregator = Aggregator(
             llm_input_dim=self.hidden_size,
-            **{"in_channels": self.latent_dim, **config.aggregator},
+            **{"in_channels": self.latent_dim, "native_attention": config.strict_weight_loading, **config.aggregator},
         )
         self.stop_head = nn.Linear(self.hidden_size, 2, bias=True)
         self.spk_head = nn.Linear(SPEAKER_EMBEDDING_DIM, self.hidden_size, bias=True)
@@ -320,24 +311,90 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         runtime_additional_information: list[dict] | None = None,
+        request_ids: list[str] | None = None,
         **kwargs,
     ) -> OmniOutput:
-        """Run TTS generation and return audio output.
+        """Return the next audio chunk, or the full waveform for offline calls.
 
-        The full autoregressive generation loop is executed inside this method.
+        Engine requests carry request_ids and keep background generation alive
+        across steps. Direct calls and profiling run the full loop inline.
         """
         additional_info = self._extract_additional_info(runtime_additional_information)
         params = self._resolve_generation_params(additional_info)
-        voice = self._resolve_voice(additional_info)
+        if request_ids and params.stream_decode and not params.trim_trailing_silence:
+            if len(request_ids) != 1:
+                raise ValueError("Ming streaming Talker requires max_num_seqs=1")
+            return self._stream_forward(request_ids[0], input_ids, inputs_embeds, additional_info, params)
+        devices = [self.device.index] if self.device.type == "cuda" else []
+        # Isolate seeded inference from other requests. Reference VAE sampling
+        # uses its own generator, so cache hits do not change CFM's RNG stream.
+        with torch.random.fork_rng(devices=devices, enabled=params.seed is not None):
+            if params.seed is not None:
+                torch.manual_seed(params.seed)
+            voice = self._resolve_voice(additional_info)
+            latents = self._generate_latents(
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                text=additional_info.get("text", ""),
+                params=params,
+                voice=voice,
+            )
+            return self._decode_to_output(
+                latents, stream_decode=params.stream_decode, trim_silence=params.trim_trailing_silence
+            )
 
-        latents = self._generate_latents(
-            input_ids=input_ids,
-            inputs_embeds=inputs_embeds,
-            text=additional_info.get("text", ""),
-            params=params,
-            voice=voice,
-        )
-        return self._decode_to_output(latents, stream_decode=params.stream_decode)
+    def get_pending_generation_request_ids(self) -> set[str]:
+        return set(self._stream_jobs)
+
+    def on_requests_finished(self, request_ids) -> None:
+        for request_id in request_ids:
+            job = self._stream_jobs.pop(request_id, None)
+            if job is not None:
+                job.close()
+
+    def _stream_forward(self, request_id, input_ids, inputs_embeds, info, params) -> OmniOutput:
+        job = self._stream_jobs.get(request_id)
+        if job is None:
+            if self._stream_jobs:
+                raise ValueError("Ming streaming Talker supports one active request per worker")
+            if self.audio_vae is None:
+                raise RuntimeError("Streaming Talker requires AudioVAE")
+            # Runner inputs are reusable buffers; the producer must own them.
+            input_ids = input_ids.clone() if input_ids is not None else None
+            inputs_embeds = inputs_embeds.clone() if inputs_embeds is not None else None
+
+            def produce(on_latent):
+                devices = [self.device.index] if self.device.type == "cuda" else []
+                with torch.random.fork_rng(devices=devices, enabled=params.seed is not None):
+                    if params.seed is not None:
+                        torch.manual_seed(params.seed)
+                    voice = self._resolve_voice(info)
+                    self._generate_latents(
+                        input_ids=input_ids,
+                        inputs_embeds=inputs_embeds,
+                        text=info.get("text", ""),
+                        params=params,
+                        voice=voice,
+                        on_latent=on_latent,
+                    )
+
+            job = MingStreamingJob(produce, self.audio_vae, self.device)
+            self._stream_jobs[request_id] = job
+        try:
+            audio, last = job.next_audio()
+            output = OmniOutput(
+                text_hidden_states=None,
+                multimodal_outputs={
+                    "audio": audio.detach().float().cpu(),
+                    "sr": torch.tensor(self.audio_vae.config.sample_rate),
+                },
+            )
+        except BaseException:
+            self.on_requests_finished([request_id])
+            raise
+        if last:
+            self.on_requests_finished([request_id])
+        return output
 
     @staticmethod
     def _extract_additional_info(
@@ -351,39 +408,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         return {}
 
     def _resolve_generation_params(self, additional_info: dict[str, Any]) -> _GenerationParams:
-        # "omni"    : thinker -> talker hand-off with hardcoded defaults
-        # "instruct": standalone TTS with caller-supplied sampling knobs
-        ming_task = additional_info.get("ming_task", "instruct")
-
-        if ming_task == "omni":
-            prompt = MING_DEFAULT_PROMPT
-            instruction = None
-            use_zero_spk_emb = additional_info.get("spk_emb") is None
-            cfg = 2.0
-            sigma = 0.25
-            temperature = 0.0
-            max_steps = 200
-        else:
-            prompt = additional_info.get("prompt", MING_DEFAULT_PROMPT)
-            instruction = additional_info.get("instruction", None)
-            use_zero_spk_emb = additional_info.get("use_zero_spk_emb", False)
-            cfg = additional_info.get("cfg", self.cfg_strength)
-            sigma = additional_info.get("sigma", 0.25)
-            temperature = additional_info.get("temperature", 0.0)
-            max_steps = int(additional_info.get("max_steps", additional_info.get("max_decode_steps", 200)))
-
-        return _GenerationParams(
-            prompt=prompt,
-            instruction=instruction,
-            cfg=cfg,
-            sigma=sigma,
-            temperature=temperature,
-            max_steps=max_steps,
-            use_zero_spk_emb=use_zero_spk_emb,
-            max_text_length=int(additional_info.get("max_text_length", 50)),
-            use_static_cache=bool(additional_info.get("use_static_cache", True)),
-            stream_decode=bool(additional_info.get("stream_decode", True)),
-        )
+        return resolve_generation_params(additional_info, self.config)
 
     def _resolve_voice(self, additional_info: dict[str, Any]) -> _VoiceContext:
         spk_emb = additional_info.get("spk_emb", None)
@@ -391,6 +416,15 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         prompt_wav_lat = additional_info.get("prompt_wav_lat", None)
         prompt_wav_emb = additional_info.get("prompt_wav_emb", None)
         already_projected = False
+
+        if (
+            self.config.strict_weight_loading
+            or "speaker_conditioning" in additional_info
+            or "prompt_audio_mode" in additional_info
+            or "prompt_wav" in additional_info
+            or "reference_audio" in additional_info
+        ):
+            return self._resolve_formal_voice(additional_info)
 
         voice_name = additional_info.get("voice_name", None)
         if voice_name and spk_emb is None and voice_name in self.voice_presets:
@@ -410,11 +444,75 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             already_projected=already_projected,
         )
 
+    def _resolve_formal_voice(self, info: dict[str, Any]) -> _VoiceContext:
+        spk_emb = info.get("spk_emb")
+        reference = info.get("prompt_wav")
+        reference_audio = info.get("reference_audio")
+        preset = self.voice_presets.get(info.get("voice_name")) or {}
+        has_reference = spk_emb is not None or bool(reference) or bool(reference_audio) or bool(preset)
+        mode, audio_mode = resolve_conditioning_modes(info, has_reference=has_reference)
+        need_speaker = mode == "prompt" and spk_emb is None
+        need_latents = audio_mode == "continuation"
+        projected = False
+        if (reference or reference_audio) and (need_speaker or need_latents):
+            preset = self.voice_presets.resolve_reference(
+                reference,
+                reference_audio=reference_audio,
+                device=self.device,
+                dtype=self.dtype,
+                need_speaker=need_speaker,
+                need_latents=need_latents and info.get("prompt_wav_lat") is None,
+            )
+        if mode == "prompt":
+            if spk_emb is None:
+                spk_emb = preset.get("spk_emb")
+                projected = True
+            if spk_emb is None or isinstance(spk_emb, list) and not spk_emb:
+                raise ValueError("Reference did not provide a speaker embedding")
+        elif mode == "zero":
+            spk_emb = [torch.zeros(1, self.spk_head.in_features, device=self.device, dtype=self.dtype)]
+        elif mode == "mute":
+            spk_emb = [torch.zeros(1, self.hidden_size, device=self.device, dtype=self.dtype)]
+            projected = True
+        else:
+            spk_emb = None
+        # Explicit off/instruct must not be replaced by the legacy zero slot.
+        if spk_emb is None:
+            projected = True
+        latents = info.get("prompt_wav_lat")
+        embeddings = info.get("prompt_wav_emb")
+        if latents is None:
+            latents = preset.get("prompt_wav_lat")
+        if embeddings is None:
+            embeddings = preset.get("prompt_wav_emb")
+        if need_latents and latents is not None:
+            latents = torch.as_tensor(latents, device=self.device, dtype=self.dtype)
+            if latents.ndim != 3 or latents.shape[0] != 1 or latents.shape[-1] != self.latent_dim:
+                raise ValueError("prompt_wav_lat must have shape [1, frames, latent_dim]")
+            if latents.shape[1] % self.patch_size:
+                raise ValueError("Reference latent frames must be divisible by talker patch_size")
+            if embeddings is None:
+                patches = latents.reshape(-1, self.patch_size, self.latent_dim)
+                embeddings = self.aggregator(patches).reshape(1, -1, self.hidden_size)
+        if need_latents and embeddings is not None:
+            embeddings = torch.as_tensor(embeddings, device=self.device, dtype=self.dtype)
+            if embeddings.ndim != 3 or embeddings.shape[0] != 1 or embeddings.shape[-1] != self.hidden_size:
+                raise ValueError("prompt_wav_emb must have shape [1, patches, hidden_size]")
+        return _VoiceContext(
+            spk_emb=spk_emb,
+            prompt_text=(info.get("prompt_text") if info.get("prompt_text") is not None else preset.get("prompt_text"))
+            if need_latents
+            else None,
+            prompt_wav_lat=latents if need_latents else None,
+            prompt_wav_emb=embeddings if need_latents else None,
+            already_projected=projected,
+        )
+
     def _project_spk_emb(
         self, spk_emb: Any, already_projected: bool, use_zero_spk_emb: bool
     ) -> list[torch.Tensor] | None:
         if spk_emb is None:
-            if use_zero_spk_emb:
+            if use_zero_spk_emb and not already_projected:
                 return [torch.zeros(1, self.hidden_size, device=self.device, dtype=self.dtype)]
             return None
 
@@ -422,13 +520,15 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             return spk_emb if isinstance(spk_emb, list) else [spk_emb]
 
         if isinstance(spk_emb, torch.Tensor):
-            tensors = [spk_emb]
-        elif isinstance(spk_emb, list) and spk_emb and isinstance(spk_emb[0], (int, float)):
-            tensors = [torch.tensor(spk_emb, dtype=self.dtype).unsqueeze(0)]
+            tensors = [row.unsqueeze(0) for row in spk_emb.reshape(-1, spk_emb.shape[-1])]
+        elif isinstance(spk_emb, list) and spk_emb and isinstance(spk_emb[0], int | float):
+            tensors = [torch.as_tensor(spk_emb).unsqueeze(0)]
         elif isinstance(spk_emb, list):
-            tensors = spk_emb
+            tensors = [torch.as_tensor(t).reshape(1, -1) for t in spk_emb]
         else:
             tensors = [spk_emb]
+        if any(t.shape[-1] != self.spk_head.in_features for t in tensors):
+            raise ValueError(f"Raw speaker embeddings must have {self.spk_head.in_features} features")
         return [self.spk_head(t.to(device=self.device, dtype=self.dtype)) for t in tensors]
 
     def _generate_latents(
@@ -439,6 +539,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         text: str,
         params: _GenerationParams,
         voice: _VoiceContext,
+        on_latent=None,
     ) -> list[torch.Tensor]:
         generator = self.audio_generator
 
@@ -448,6 +549,9 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                 inputs_embeds=inputs_embeds,
                 prompt_wav_lat=voice.prompt_wav_lat,
                 max_steps=params.max_steps,
+                min_new_token=params.min_steps,
+                stop_threshold=params.stop_threshold,
+                on_latent=on_latent,
                 cfg=params.cfg,
                 sigma=params.sigma,
                 temperature=params.temperature,
@@ -455,7 +559,15 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             )
 
         spk_emb = self._project_spk_emb(voice.spk_emb, voice.already_projected, params.use_zero_spk_emb)
-        text_segments = segment_and_normalize(text, max_length=params.max_text_length) if text else []
+        text_segments = (
+            (
+                segment_and_normalize(text, max_length=params.max_text_length, tn_mode=params.tn_mode)
+                if params.normalize_text
+                else [text]
+            )
+            if text
+            else []
+        )
 
         if not text_segments:
             # vLLM passes 1D input_ids; Qwen2Model expects (batch, seq).
@@ -464,6 +576,9 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                 inputs_embeds=inputs_embeds,
                 prompt_wav_lat=voice.prompt_wav_lat,
                 max_steps=params.max_steps,
+                min_new_token=params.min_steps,
+                stop_threshold=params.stop_threshold,
+                on_latent=on_latent,
                 cfg=params.cfg,
                 sigma=params.sigma,
                 temperature=params.temperature,
@@ -471,7 +586,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             )
 
         all_latents: list[torch.Tensor] = []
-        for segment in text_segments:
+        for segment_index, segment in enumerate(text_segments):
             seg_embeds, _ = build_tts_input(
                 tokenizer=self.tokenizer,
                 embed_tokens=self.model.get_input_embeddings(),
@@ -484,12 +599,21 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                 prompt_text=voice.prompt_text,
                 prompt_wav_emb=voice.prompt_wav_emb,
             )
-            effective_max_steps = generator.duration_capped_steps(len(segment), params.max_steps)
+            effective_max_steps = (
+                generator.duration_capped_steps(len(segment), params.max_steps)
+                if params.duration_limit
+                else params.max_steps
+            )
             all_latents.extend(
                 generator.generate_latents(
                     inputs_embeds=seg_embeds,
                     prompt_wav_lat=voice.prompt_wav_lat,
                     max_steps=effective_max_steps,
+                    min_new_token=params.min_steps,
+                    stop_threshold=params.stop_threshold,
+                    on_latent=(lambda latent, last: on_latent(latent, last and segment_index == len(text_segments) - 1))
+                    if on_latent is not None
+                    else None,
                     cfg=params.cfg,
                     sigma=params.sigma,
                     temperature=params.temperature,
@@ -498,11 +622,13 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             )
         return all_latents
 
-    def _decode_to_output(self, latents: list[torch.Tensor], *, stream_decode: bool) -> OmniOutput:
+    def _decode_to_output(
+        self, latents: list[torch.Tensor], *, stream_decode: bool, trim_silence: bool = True
+    ) -> OmniOutput:
         multimodal_outputs: dict[str, Any] = {}
         if latents and self.audio_vae is not None:
             waveform = self.audio_generator.decode_to_waveform(latents, stream_decode=stream_decode)
-            if not stream_decode:
+            if trim_silence:
                 waveform = self.audio_generator.trim_trailing_silence(waveform)
             multimodal_outputs["audio"] = waveform.detach().float().cpu()
             multimodal_outputs["sr"] = torch.tensor(self.audio_vae.config.sample_rate)
@@ -536,11 +662,12 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         if self.audio_vae is not None and self._vae_weight_source is not None:
             loaded.update(self._load_vae_weights())
 
-        # Register voice presets after all weights (incl. VAE) are loaded.
-        try:
-            self.voice_presets.load_presets_from_manifest(device=self.device, dtype=self.dtype)
-        except Exception as e:  # pragma: no cover — best-effort
-            logger.warning("Voice preset loading failed (non-fatal): %s", e)
+        if self.config.strict_weight_loading:
+            if self.audio_vae is None:
+                raise RuntimeError("Formal TTS requires the checkpoint's AudioVAE")
+            missing = set(dict(self.named_parameters())) - loaded
+            if missing:
+                raise RuntimeError(f"Incomplete formal talker weights ({len(missing)} missing): {sorted(missing)[:20]}")
 
         return loaded
 
@@ -549,7 +676,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         model_root = resolve_model_to_local_path(
             self._model_path,
             allow_download=True,
-            allow_patterns=["talker/model*.safetensors"],
+            allow_patterns=["model*.safetensors", "talker/model*.safetensors"],
             cache_dir=self.vllm_config.load_config.download_dir,
         )
 
