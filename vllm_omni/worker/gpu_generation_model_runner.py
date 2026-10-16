@@ -502,6 +502,11 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         )
         output.omni_connector_output = self.get_omni_connector_output()
         output.routed_experts = routed_experts_lists
+        model = getattr(self, "model", None)
+        if hasattr(model, "get_pending_generation_request_ids"):
+            output.pending_generation_req_ids = set(req_ids_output_copy).intersection(
+                model.get_pending_generation_request_ids()
+            )
 
         if not self.use_async_scheduling:
             return output

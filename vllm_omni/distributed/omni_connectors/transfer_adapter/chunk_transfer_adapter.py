@@ -1485,6 +1485,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self,
         scheduler_output: Any,
         requests: dict[str, Request] | None = None,
+        *,
+        consume_chunks: bool = True,
     ) -> None:
         """
         Add additional info for cached requests and
@@ -1499,7 +1501,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if requests is not None:
             self.attach_cached_additional_information(scheduler_output, requests)
-        self._clear_chunk_ready(scheduler_output)
+        if consume_chunks:
+            self._clear_chunk_ready(scheduler_output)
+
+    def mark_chunk_consumed(self, request_id: str) -> None:
+        """Release an input only after its generation output is complete."""
+        self.requests_with_ready_chunks.discard(request_id)
 
     @staticmethod
     def attach_cached_additional_information(scheduler_output: Any, requests: dict[str, Request]) -> None:

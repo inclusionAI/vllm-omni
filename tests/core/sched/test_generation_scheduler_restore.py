@@ -46,7 +46,7 @@ class FakeAdapter:
         running.extend(self.waiting_for_chunk_running_requests)
         self.waiting_for_chunk_running_requests = deque()
 
-    def postprocess_scheduler_output(self, output):
+    def postprocess_scheduler_output(self, output, requests=None, *, consume_chunks=True):
         pass
 
 
@@ -182,6 +182,24 @@ def test_generation_scheduler_schedules_terminal_empty_prompt_chunk_once(monkeyp
     assert output.num_scheduled_tokens == {"terminal": 1}
     assert output.scheduled_new_reqs[0].req_id == "terminal"
     assert scheduler._pending_finish_reqs == []
+
+
+@pytest.mark.parametrize("in_running", [False, True])
+def test_generation_waits_for_in_flight_result_before_finishing(in_running: bool) -> None:
+    request = _chunk_request("in-flight", num_computed_tokens=1, num_in_flight_tokens=1, status=RequestStatus.RUNNING)
+    scheduler = _make_generation_scheduler(request)
+    scheduler.chunk_transfer_adapter.process_pending_chunks = lambda *args, **kwargs: None
+    scheduler.chunk_transfer_adapter.done_request_ids.add(request.request_id)
+    if in_running:
+        scheduler.waiting.pop_request()
+        scheduler.running.append(request)
+
+    output = scheduler.schedule()
+
+    assert not output.num_scheduled_tokens
+    assert not scheduler._pending_finish_reqs
+    assert request.num_computed_tokens == 1
+    assert request.num_in_flight_tokens == 1
 
 
 class TestRestoreQueuesOnError:
