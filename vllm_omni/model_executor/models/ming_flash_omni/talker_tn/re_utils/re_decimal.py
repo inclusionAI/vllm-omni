@@ -8,21 +8,22 @@ from .re_utils import merge_punc_measure
 
 
 class REDecimal:
-    name = 'decimal'
+    name = "decimal"
+
     def __init__(self, int_part, frac_part, range_digit=None):
-        self.txt = f'{int_part.txt}.{frac_part.txt}'
+        self.txt = f"{int_part.txt}.{frac_part.txt}"
         self.int_part, self.frac_part = int_part, frac_part
         self.range_digit = range_digit
 
     def to_string(self):
         if self.range_digit:
-            return f'{self.range_digit.to_string()}至{self.int_part.to_string()}点{self.frac_part.to_string_direct()}'
-        return f'{self.int_part.to_string()}点{self.frac_part.to_string_direct()}'
+            return f"{self.range_digit.to_string()}至{self.int_part.to_string()}点{self.frac_part.to_string_direct()}"
+        return f"{self.int_part.to_string()}点{self.frac_part.to_string_direct()}"
 
     @classmethod
     def score_digits(cls, stack, idx):
         digits = stack[idx]
-        if len(digits) == 3 and digits[1].txt == '.':
+        if len(digits) == 3 and digits[1].txt == ".":
             return 50
         return -1
 

@@ -8,7 +8,7 @@ from .re_utils import merge_punc_measure
 
 
 class REPercent:
-    name = 'percent'
+    name = "percent"
 
     def __init__(self, digit, range_digit=None):
         self.digit = digit
@@ -16,13 +16,13 @@ class REPercent:
 
     def to_string(self):
         if self.range_digit:
-            return f'百分之{self.range_digit.to_string()}至{self.digit.to_string()}'
-        return f'百分之{self.digit.to_string()}'
+            return f"百分之{self.range_digit.to_string()}至{self.digit.to_string()}"
+        return f"百分之{self.digit.to_string()}"
 
     @classmethod
     def try_digit(cls, stack, idx):
-        if idx + 1 < len(stack) and stack[idx+1].txt.startswith('%'):
-            stack[idx+1].txt = stack[idx+1].txt[1:]
+        if idx + 1 < len(stack) and stack[idx + 1].txt.startswith("%"):
+            stack[idx + 1].txt = stack[idx + 1].txt[1:]
             stack[idx] = REPercent(stack[idx])
             return True
         return False

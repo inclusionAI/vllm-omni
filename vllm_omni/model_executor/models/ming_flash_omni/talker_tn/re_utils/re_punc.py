@@ -8,7 +8,7 @@ from .re_base import REBase
 
 
 class REPunc(REBase):
-    name = 'punc'
+    name = "punc"
 
     def __init__(self, txt):
         super().__init__(txt)

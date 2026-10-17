@@ -4,11 +4,11 @@
 # Author: wanren
 # Email: wanren.pj@antgroup.com
 # Date: 2025/10/21
-from .re_utils import try_digit_before, try_digit_after, merge_punc_measure
+from .re_utils import merge_punc_measure, try_digit_after, try_digit_before
 
 
 class REMeasureBefore:
-    name = 'measure_before'
+    name = "measure_before"
     measure_d, measure_len_s = {}, set()
 
     @classmethod
@@ -26,15 +26,15 @@ class REMeasureBefore:
 
     def to_string(self):
         if self.range_digit:
-            return f'{self.tag_measure}{self.range_digit.to_string()}至{self.re_digit.to_string()}'
-        return f'{self.tag_measure}{self.re_digit.to_string()}'
+            return f"{self.tag_measure}{self.range_digit.to_string()}至{self.re_digit.to_string()}"
+        return f"{self.tag_measure}{self.re_digit.to_string()}"
 
     @classmethod
     def try_digit(cls, stack, idx):
         if try_digit_before(stack, idx, cls.measure_d, cls.measure_len_s, cls):
             return True
-        if idx > 0 and stack[idx-1].name == 'measure_after' and stack[idx-1].tag_measure == '等于':
-            stack[idx] = REMeasureBefore(stack[idx], '')
+        if idx > 0 and stack[idx - 1].name == "measure_after" and stack[idx - 1].tag_measure == "等于":
+            stack[idx] = REMeasureBefore(stack[idx], "")
             return True
         return False
 
@@ -44,7 +44,7 @@ class REMeasureBefore:
 
 
 class REMeasureAfter:
-    name = 'measure_after'
+    name = "measure_after"
     measure_d, measure_len_s = {}, set()
 
     @classmethod
@@ -62,8 +62,8 @@ class REMeasureAfter:
 
     def to_string(self):
         if self.range_digit:
-            return f'{self.range_digit.to_string()}至{self.re_digit.to_string()}{self.tag_measure}'
-        return f'{self.re_digit.to_string()}{self.tag_measure}'
+            return f"{self.range_digit.to_string()}至{self.re_digit.to_string()}{self.tag_measure}"
+        return f"{self.re_digit.to_string()}{self.tag_measure}"
 
     @classmethod
     def try_digit(cls, stack, idx):

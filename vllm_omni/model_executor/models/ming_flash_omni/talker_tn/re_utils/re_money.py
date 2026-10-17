@@ -4,11 +4,11 @@
 # Author: wanren
 # Email: wanren.pj@antgroup.com
 # Date: 2025/10/21
-from .re_utils import try_digit_before, try_digit_after, merge_punc_measure
+from .re_utils import merge_punc_measure, try_digit_after, try_digit_before
 
 
 class REMoney:
-    name = 'money'
+    name = "money"
     money_d, money_len_s = {}, set()
 
     @classmethod
@@ -26,8 +26,8 @@ class REMoney:
 
     def to_string(self):
         if self.range_digit:
-            return f'{self.range_digit.to_string()}至{self.re_digit.to_string()}{self.tag_money}'
-        return f'{self.re_digit.to_string()}{self.tag_money}'
+            return f"{self.range_digit.to_string()}至{self.re_digit.to_string()}{self.tag_money}"
+        return f"{self.re_digit.to_string()}{self.tag_money}"
 
     @classmethod
     def merge_punc(cls, stack, idx):

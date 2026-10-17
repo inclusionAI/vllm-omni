@@ -7,13 +7,13 @@
 
 
 class REBase:
-    name = 'base'
+    name = "base"
 
     def __init__(self, txt):
         self.txt = txt
 
     def __repr__(self):
-        return f'{self.name}: {self.txt}'
+        return f"{self.name}: {self.txt}"
 
     def append_txt(self, txt):
         self.txt += txt

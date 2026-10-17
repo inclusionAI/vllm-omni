@@ -8,18 +8,18 @@ from .re_utils import merge_punc_range
 
 
 class REIp:
-    name = 'ip'
+    name = "ip"
 
     def __init__(self, ip_s):
         self.ip_s = ip_s
 
     def to_string(self):
-        return '点'.join(ii.to_string_yao() for ii in self.ip_s)
+        return "点".join(ii.to_string_yao() for ii in self.ip_s)
 
     @classmethod
     def score_digits(cls, stack, idx):
         digits = stack[idx]
-        if len(digits) == 7 and digits[1].txt == digits[3].txt == digits[5].txt == '.':
+        if len(digits) == 7 and digits[1].txt == digits[3].txt == digits[5].txt == ".":
             return 50
         return -1
 

@@ -4,11 +4,11 @@
 # Author: wanren
 # Email: wanren.pj@antgroup.com
 # Date: 2025/10/21
-from .re_utils import try_digit_before, try_digit_after
+from .re_utils import try_digit_after, try_digit_before
 
 
 class RESerialBefore:
-    name = 'serial_before'
+    name = "serial_before"
     serial_d, serial_len_s = {}, set()
 
     @classmethod
@@ -24,7 +24,7 @@ class RESerialBefore:
         self.re_digit, self.tag_serial = re_digit, tag_serial
 
     def to_string(self):
-        return f'{self.tag_serial}{self.re_digit.to_string_yao()}'
+        return f"{self.tag_serial}{self.re_digit.to_string_yao()}"
 
     @classmethod
     def try_digit(cls, stack, idx):
@@ -36,7 +36,7 @@ class RESerialBefore:
 
 
 class RESerialAfter:
-    name = 'serial_after'
+    name = "serial_after"
     serial_d, serial_len_s = {}, set()
 
     @classmethod
@@ -52,7 +52,7 @@ class RESerialAfter:
         self.re_digit, self.tag_serial = re_digit, tag_serial
 
     def to_string(self):
-        return f'{self.re_digit.to_string_yao()}{self.tag_serial}'
+        return f"{self.re_digit.to_string_yao()}{self.tag_serial}"
 
     @classmethod
     def try_digit(cls, stack, idx):

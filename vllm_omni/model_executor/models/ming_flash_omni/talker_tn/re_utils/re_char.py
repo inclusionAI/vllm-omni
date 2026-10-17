@@ -8,7 +8,7 @@ from .re_base import REBase
 
 
 class REChar(REBase):
-    name = 'char'
+    name = "char"
 
     def __init__(self, txt):
         super().__init__(txt)

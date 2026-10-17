@@ -8,7 +8,7 @@ from .re_utils import merge_punc_measure
 
 
 class REFrac:
-    name = 'frac'
+    name = "frac"
 
     def __init__(self, num, den, range_digit=None):
         self.num, self.den = num, den
@@ -16,15 +16,15 @@ class REFrac:
 
     def to_string(self):
         if self.range_digit:
-            return f'{self.range_digit.to_string()}至{self.den.to_string()}分之{self.num.to_string()}'
-        return f'{self.den.to_string()}分之{self.num.to_string()}'
+            return f"{self.range_digit.to_string()}至{self.den.to_string()}分之{self.num.to_string()}"
+        return f"{self.den.to_string()}分之{self.num.to_string()}"
 
     @classmethod
     def score_digits(cls, stack, idx):
         digits = stack[idx]
-        if len(digits) == 3 and digits[1].txt == '/':
+        if len(digits) == 3 and digits[1].txt == "/":
             return 50
-        elif len(digits) == 5 and digits[1].txt in {'-', '~', '～'} and digits[3].txt == '/':
+        elif len(digits) == 5 and digits[1].txt in {"-", "~", "～"} and digits[3].txt == "/":
             return 50
         return -1
 
