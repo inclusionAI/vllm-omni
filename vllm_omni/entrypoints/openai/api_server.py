@@ -1160,6 +1160,20 @@ async def omni_init_app_state(
         is not None,
     )
 
+    if (
+        state.openai_serving_chat is not None
+        and getattr(state.openai_serving_chat, "_has_ming3_talker_stage", lambda: False)()
+    ):
+        from vllm_omni.entrypoints.openai.ming3_voices import register_model_voice_presets
+
+        await register_model_voice_presets(
+            state.openai_serving_speech,
+            args.model,
+            revision=getattr(args, "revision", None),
+            cache_dir=getattr(args, "download_dir", None),
+        )
+        state.openai_serving_chat._ming3_speech_service = state.openai_serving_speech
+
     # Warm up speech pipeline (CUDA Graph capture, torch.compile) so the first
     # real user request is fast instead of paying a 100s compilation tax.
     await state.openai_serving_speech.warmup()
@@ -1511,6 +1525,7 @@ async def list_voices(raw_request: Request):
     if hasattr(handler, "uploaded_speakers"):
         for voice_name, info in handler.uploaded_speakers.items():
             voice_entry = {
+                "id": voice_name,
                 "name": info.get("name", voice_name),
                 "consent": info.get("consent", ""),
                 "created_at": info.get("created_at", 0),
@@ -1634,6 +1649,7 @@ async def upload_voice(
         else:
             return _create_speech_error_json_response("Either 'audio_sample' or 'speaker_embedding' must be provided")
 
+        result["id"] = name.strip().lower()
         return JSONResponse(content={"success": True, "voice": result})
 
     except ValueError as e:
@@ -1776,6 +1792,13 @@ async def realtime_websocket(websocket: WebSocket):
         await websocket.accept()
         await websocket.send_json({"type": "error", "code": "unsupported", "error": "VAD realtime is not enabled"})
         await websocket.close(code=1008)
+        return
+
+    chat = getattr(websocket.app.state, "openai_serving_chat", None)
+    if chat is not None and getattr(chat, "_ming3_speech_service", None) is not None:
+        from vllm_omni.entrypoints.openai.ming3_realtime import Ming3RealtimeConnection
+
+        await Ming3RealtimeConnection(websocket, chat).handle_connection()
         return
 
     serving = getattr(websocket.app.state, "openai_serving_realtime", None)

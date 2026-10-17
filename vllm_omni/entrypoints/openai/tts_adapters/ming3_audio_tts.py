@@ -41,6 +41,13 @@ class Ming3AudioTTSAdapter(ARTTSAdapter):
             return "'initial_codec_chunk_frames' is not supported for Ming3 Audio TTS"
         if request.voice and request.ref_audio is not None:
             return "Choose either an IP voice or ref_audio for voice cloning"
+        # Registered names select stored reference conditioning. Keep standalone
+        # IP names working when no stored voice matches.
+        if request.voice and request.voice.lower() in server.uploaded_speakers:
+            error = server._apply_uploaded_speaker(request)
+            if error:
+                return error
+            request.voice = None
         if request.ref_text is not None and request.ref_audio is None:
             return "ref_text requires ref_audio"
         if not request.voice and request.ref_audio is None and request.speaker_embedding is None:

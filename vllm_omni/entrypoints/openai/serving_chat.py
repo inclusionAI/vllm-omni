@@ -281,12 +281,28 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             model_stage == "ming3_tts" for _, model_stage in metadata
         )
 
-    async def _attach_ming3_reference_audio(self, engine_prompt: TokPrompt) -> None:
-        """Decode a chat request's base64 ref_audio before the Talker handoff."""
+    async def _attach_ming3_reference_audio(self, engine_prompt: TokPrompt, request=None) -> None:
+        """Resolve named voices or inline references before the Talker handoff."""
         if not self._has_ming3_talker_stage():
             return
-        info = engine_prompt.get("additional_information")
-        if not isinstance(info, dict) or "ref_audio" not in info:
+        info = self._ensure_prompt_additional_information(engine_prompt)
+        if info.get("voice_mode") != "ip":
+            # Chat uses audio.voice; Realtime's session.audio.output.voice is
+            # resolved into the same controls before the request reaches here.
+            audio = getattr(request, "audio", None)
+            selected = audio.get("voice") if isinstance(audio, dict) else getattr(audio, "voice", None)
+            selected = selected or info.get("voice_name") or info.get("voice")
+            if selected is not None:
+                if any(info.get(k) is not None for k in ("ref_audio", "reference_audio", "prompt_wav", "spk_emb")):
+                    raise ValueError("Choose either a stored voice or reference audio/speaker embedding")
+                from vllm_omni.entrypoints.openai.ming3_voices import resolve_stored_voice
+
+                store = getattr(self, "_ming3_speech_service", None)
+                if store is None:
+                    raise ValueError("Ming3 voice storage is not initialized")
+                info.update(await resolve_stored_voice(store, selected))
+                return
+        if "ref_audio" not in info:
             return
         if info.get("voice_mode") == "ip" or info.get("ip_name") or info.get("voice_name"):
             raise ValueError("Choose either an IP voice or ref_audio for voice cloning")
@@ -1031,7 +1047,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             prompt_additional_information["deferred_multi_modal_data"] = deferred_multi_modal_data
 
         await self._attach_minicpmo45_reference_audio(engine_prompt, request)
-        await self._attach_ming3_reference_audio(engine_prompt)
+        await self._attach_ming3_reference_audio(engine_prompt, request)
 
         speaker = getattr(request, "voice", None) or getattr(request, "speaker", None)
         normalized = validate_requested_speaker(speaker, self._get_supported_speakers())

@@ -480,6 +480,7 @@ class TestSpeechAPI:
         assert response.json()["voices"] == ["alice", "bob", "carol", "default"]
         assert response.json()["uploaded_voices"] == [
             {
+                "id": "carol",
                 "name": "Carol",
                 "consent": "",
                 "created_at": 1,
