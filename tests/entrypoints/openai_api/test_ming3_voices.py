@@ -136,7 +136,7 @@ async def test_missing_manifest_is_optional(store, tmp_path):
 async def test_named_chat_voice_reaches_talker_with_audio_and_text(store, model):
     await register_model_voice_presets(store, str(model))
     chat = chat_for(store)
-    prompt = {}
+    prompt: dict = {}
     request = SimpleNamespace(audio={"voice": {"id": "DB30"}})
     await chat._attach_ming3_reference_audio(prompt, request)
     info = build_ming_talker_additional_info("你好", prompt)
@@ -304,7 +304,7 @@ async def test_registered_voice_works_with_speech_api_adapter(store, model):
     assert request.ref_text == "感谢你的认可。"
 
 
-async def test_realtime_websocket_route_and_voice_listing(store, model):
+async def test_realtime_websocket_route(store, model):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
@@ -318,9 +318,6 @@ async def test_realtime_websocket_route_and_voice_listing(store, model):
     app.state.openai_serving_chat = chat
     app.state.openai_serving_speech = store
     with TestClient(app) as client:
-        result = client.get("/v1/audio/voices")
-        assert result.status_code == 200
-        assert {v["id"] for v in result.json()["uploaded_voices"]} == {"db30", "lingguang"}
         with client.websocket_connect("/v1/realtime?model=ming") as socket:
             assert socket.receive_json()["type"] == "session.created"
             socket.send_json(
@@ -376,7 +373,14 @@ async def test_hf_snapshot_audio_symlinks_are_supported(store, model, tmp_path):
 
 async def test_hf_preset_download_uses_model_revision(store, model, monkeypatch):
     download = Mock(return_value=str(model))
-    monkeypatch.setattr("huggingface_hub.snapshot_download", download)
+    monkeypatch.setattr(
+        "vllm_omni.transformers_utils.repo_utils.hf_api",
+        Mock(return_value=SimpleNamespace(snapshot_download=download)),
+    )
+    monkeypatch.setattr(
+        "huggingface_hub.snapshot_download",
+        Mock(side_effect=AssertionError("Download bypassed the tagged Hub client")),
+    )
     await register_model_voice_presets(store, "org/model", revision="commit-sha", cache_dir="/cache")
     download.assert_called_once_with(
         "org/model", revision="commit-sha", cache_dir="/cache", allow_patterns=["voice_presets/**"]

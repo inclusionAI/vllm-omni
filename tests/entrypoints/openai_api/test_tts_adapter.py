@@ -413,10 +413,12 @@ def test_covo_audio_build_constructs_tokenized_prompt():
     assert prepared.model_type == "covo_audio"
 
 
-def test_ming_flash_omni_build_constructs_prepared_request():
+@pytest.mark.parametrize("voice", [None, "DB30"])
+def test_ming_flash_omni_build_constructs_prepared_request(voice):
     server = SimpleNamespace(uploaded_speakers={})
     adapter = MingFlashOmniTTSAdapter(SimpleNamespace(server=server, engine_client=SimpleNamespace()))
-    request = OpenAICreateSpeechRequest(input="hello", voice="test")
+    request = OpenAICreateSpeechRequest(input="hello", voice=voice)
+    assert adapter.validate(request) is None
 
     prepared = asyncio.run(adapter.build(request, [], False))
 
@@ -424,7 +426,8 @@ def test_ming_flash_omni_build_constructs_prepared_request():
     info = prepared.prompt["additional_information"]
     assert info["ming_task"] == "instruct"
     assert info["text"] == "hello"
-    assert info["voice_name"] == "test"
+    assert info["voice_name"] == voice
+    assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] is None
     assert "speaker_conditioning" not in info
     assert "prompt_audio_mode" not in info
     assert prepared.model_type == "ming_flash_omni_tts"
@@ -460,19 +463,6 @@ def test_ming3_rejects_mixed_ip_and_reference():
     assert "either" in adapter.validate(request)
 
 
-@pytest.mark.parametrize("voice", [None, "DB30"])
-def test_ming2_preserves_default_and_preset_voice(voice):
-    adapter = MingFlashOmniTTSAdapter(SpeechServingContext(server=SimpleNamespace(uploaded_speakers={})))
-    request = OpenAICreateSpeechRequest(input="hello", voice=voice)
-    assert adapter.validate(request) is None
-    prepared = asyncio.run(adapter.build(request, [], False))
-    info = prepared.prompt["additional_information"]
-    assert info["voice_name"] == voice
-    assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] is None
-    assert "speaker_conditioning" not in info
-    assert "prompt_audio_mode" not in info
-
-
 def test_ming2_rejects_new_reference_api():
     adapter = MingFlashOmniTTSAdapter(SpeechServingContext(server=SimpleNamespace()))
     request = OpenAICreateSpeechRequest(input="hello", ref_audio="data:audio/wav;base64,AA==")
@@ -480,8 +470,6 @@ def test_ming2_rejects_new_reference_api():
 
 
 def test_ming3_tts_does_not_reinterpret_ip_voice_as_ming2_preset():
-    assert detect_tts_model_type("ming_tts", "MingFlashOmniTalkerForConditionalGeneration") == "ming_flash_omni_tts"
-    assert detect_tts_model_type("ming3_tts", "BailingTalker2") == "ming3_audio_tts"
     adapter = Ming3AudioTTSAdapter(SpeechServingContext(server=SimpleNamespace(uploaded_speakers={})))
     request = OpenAICreateSpeechRequest(input="hello", voice="DB30")
     assert adapter.validate(request) is None

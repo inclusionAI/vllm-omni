@@ -1173,7 +1173,7 @@ async def omni_init_app_state(
             revision=getattr(args, "revision", None),
             cache_dir=getattr(args, "download_dir", None),
         )
-        if has_ming3_chat:
+        if has_ming3_chat and state.openai_serving_chat is not None:
             state.openai_serving_chat._ming3_speech_service = state.openai_serving_speech
 
     # Warm up speech pipeline (CUDA Graph capture, torch.compile) so the first

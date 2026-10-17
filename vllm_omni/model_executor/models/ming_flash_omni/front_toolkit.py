@@ -139,9 +139,7 @@ def chinese_punc_en2cn(text):
     while True:
         old_text = text
 
-        # 压缩完全相同的重复标点
-        # 修复: 原 r'...' 缺 f 前缀, [{ch_puncs}] 成了字面字符类(含 p/c/h/s/u/n),
-        # 导致英文双写被折叠(Apple→Aple, class→clas, css→cs)。改为 fr 前缀。
+        # Interpolate the punctuation class to preserve repeated Latin letters.
         text = re.sub(rf"([{ch_puncs}])\1+", r"\1", text)
 
         # 弱标点(，；、) 遇到 强标点(。！？) 时删除弱标点

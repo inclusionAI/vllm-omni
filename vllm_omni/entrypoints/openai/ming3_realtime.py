@@ -8,16 +8,18 @@ voice controls and the async thinker/talker handoff have one implementation.
 """
 
 import asyncio
-import base64
 import copy
 import hashlib
 import io
 import json
 from contextlib import suppress
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import numpy as np
+import pybase64 as base64
 import soundfile as sf
+from starlette.websockets import WebSocket
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.entrypoints.serve.engine.protocol import ErrorResponse
 
@@ -25,9 +27,14 @@ from vllm_omni.entrypoints.openai.ming3_voices import resolve_stored_voice, voic
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 from vllm_omni.utils.audio_resample import StreamingAudioResampler
 
+if TYPE_CHECKING:
+    from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+
 
 class Ming3RealtimeConnection(RealtimeConnection):
-    def __init__(self, websocket, serving):
+    generation_task: asyncio.Task[None] | None
+
+    def __init__(self, websocket: WebSocket, serving: "OmniOpenAIServingChat") -> None:
         super().__init__(websocket, serving)
         self._session = {
             "id": self.connection_id,
@@ -39,7 +46,7 @@ class Ming3RealtimeConnection(RealtimeConnection):
                 "output": {"format": {"type": "audio/pcm", "rate": 24000}},
             },
         }
-        self._messages = []
+        self._messages: list[dict[str, Any]] = []
         self._input_audio = bytearray()
         self._audio_started = False
         self._spoken_voice = None

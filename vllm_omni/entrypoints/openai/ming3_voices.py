@@ -7,10 +7,13 @@ import hashlib
 import io
 import json
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from starlette.datastructures import Headers, UploadFile
 from vllm.logger import init_logger
+
+if TYPE_CHECKING:
+    from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 
 logger = init_logger(__name__)
 
@@ -24,7 +27,9 @@ def voice_id(value: Any) -> str:
     return value.strip().lower()
 
 
-async def register_model_voice_presets(server, model: str, *, revision=None, cache_dir=None) -> None:
+async def register_model_voice_presets(
+    server: "OmniOpenAIServingSpeech", model: str, *, revision: str | None = None, cache_dir: str | None = None
+) -> None:
     """Import the model's manifest; unchanged registrations survive restarts.
 
     No assets are written to the model directory. An invalid manifest fails
@@ -33,11 +38,11 @@ async def register_model_voice_presets(server, model: str, *, revision=None, cac
     """
     root = Path(model).expanduser()
     if not root.is_dir():
-        from huggingface_hub import snapshot_download
+        from vllm_omni.transformers_utils.repo_utils import hf_api
 
         root = Path(
             await asyncio.to_thread(
-                snapshot_download,
+                hf_api().snapshot_download,
                 model,
                 revision=revision,
                 cache_dir=cache_dir,
@@ -96,7 +101,7 @@ async def register_model_voice_presets(server, model: str, *, revision=None, cac
     logger.info("Registered Ming3 model voices from %s: %s", manifest, sorted(names))
 
 
-async def resolve_stored_voice(server, value: Any) -> dict[str, Any]:
+async def resolve_stored_voice(server: "OmniOpenAIServingSpeech", value: Any) -> dict[str, Any]:
     """Resolve the same stored voice for Chat, Realtime and Talker handoffs."""
     name = voice_id(value)
     entry = server.uploaded_speakers.get(name)
