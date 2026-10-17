@@ -28,7 +28,7 @@ def store(tmp_path, monkeypatch):
     server = object.__new__(OmniOpenAIServingSpeech)
     server._init_speaker_storage()
     server._adapter = None
-    server._tts_model_type = "ming_flash_omni_tts"
+    server._tts_model_type = "ming3_audio_tts"
     return server
 
 
@@ -432,3 +432,87 @@ async def test_realtime_disconnect_closes_active_chat_generator(realtime, store,
     await realtime.cleanup()
     assert realtime.generation_task.done()
     assert closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_immediate_cancel_finishes_response(realtime, store, model):
+    import asyncio
+
+    async def events():
+        await asyncio.Event().wait()
+        yield "data: [DONE]\n\n"
+
+    realtime.serving.create_chat_completion = AsyncMock(return_value=events())
+    realtime._is_model_validated = True
+    realtime._messages = [{"role": "user", "content": "hello"}]
+    await realtime.handle_event({"type": "response.create"})
+    await realtime.handle_event({"type": "response.cancel"})
+    await asyncio.sleep(0)
+    await realtime.generation_task
+    assert any(e["type"] == "response.done" for e in sent(realtime))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"type": "response.create", "response": {"audio": None}},
+        {"type": "conversation.item.create", "item": None},
+        {"type": "conversation.item.create", "item": {"type": "message", "role": "user", "content": [None]}},
+    ],
+)
+async def test_invalid_event_returns_error(realtime, event):
+    realtime._messages = [{"role": "user", "content": "hello"}]
+    await realtime.handle_event(event)
+    assert sent(realtime)[-1]["type"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_control_voice_validated_on_session_update(realtime):
+    await realtime.handle_event(
+        {"type": "session.update", "session": {"additional_information": {"voice_name": "does-not-exist"}}}
+    )
+    assert sent(realtime)[-1]["type"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_reference_change_cannot_bypass_voice_lock(realtime):
+    realtime._session["additional_information"] = {"ref_audio": "first"}
+    realtime._audio_started = True
+    realtime._spoken_voice = realtime._voice_key(realtime._session)
+    await realtime.handle_event(
+        {"type": "session.update", "session": {"additional_information": {"ref_audio": "different"}}}
+    )
+    assert sent(realtime)[-1]["type"] == "error"
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+async def test_cancelled_partial_text_is_kept_in_history(realtime, interrupt):
+    import asyncio
+
+    delivered = asyncio.Event()
+
+    async def chunks():
+        yield 'data: {"choices": [{"delta": {"content": "Turn left."}}]}\n\n'
+        delivered.set()
+        await asyncio.Event().wait()
+
+    await realtime.handle_event({"type": "session.update", "session": {"output_modalities": ["text"]}})
+    realtime._messages = [{"role": "user", "content": "Where?"}]
+    realtime.serving.create_chat_completion = AsyncMock(return_value=chunks())
+    await realtime.handle_event({"type": "response.create"})
+    await asyncio.wait_for(delivered.wait(), 2)
+    if interrupt:
+        await realtime.handle_event(
+            {
+                "type": "conversation.item.create",
+                "item": {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Why left?"}]},
+            }
+        )
+    await realtime.handle_event({"type": "response.cancel"})
+    await realtime.generation_task
+    assert sent(realtime)[-1]["response"]["status"] == "cancelled"
+    assert realtime._messages[1] == {"role": "assistant", "content": "Turn left."}
+    assert len(realtime.serving.create_chat_completion.call_args.args[0].messages) == 1
+    if interrupt:
+        assert realtime._messages[-1]["role"] == "user"

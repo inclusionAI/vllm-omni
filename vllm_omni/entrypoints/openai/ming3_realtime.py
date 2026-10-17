@@ -10,6 +10,7 @@ voice controls and the async thinker/talker handoff have one implementation.
 import asyncio
 import base64
 import copy
+import hashlib
 import io
 import json
 from contextlib import suppress
@@ -42,6 +43,7 @@ class Ming3RealtimeConnection(RealtimeConnection):
         self._input_audio = bytearray()
         self._audio_started = False
         self._spoken_voice = None
+        self._response_started = asyncio.Event()
 
     async def send(self, event):
         if getattr(event, "type", None) == "session.created":
@@ -101,9 +103,15 @@ class Ming3RealtimeConnection(RealtimeConnection):
                     if key in options:
                         session[key] = options[key]
                 if "audio" in options:
-                    session["audio"]["output"].update(options["audio"].get("output", {}))
+                    audio = options["audio"]
+                    if not isinstance(audio, dict) or not isinstance(audio.get("output", {}), dict):
+                        raise ValueError("response.audio.output must be an object")
+                    session["audio"]["output"].update(audio.get("output", {}))
                 await self._validate_voice(session)
+                self._response_started.clear()
                 self.generation_task = asyncio.create_task(self._respond(session, options))
+                # Enter the response's try/finally before accepting a cancel event.
+                await self._response_started.wait()
             elif kind == "response.cancel":
                 if self.generation_task is not None and not self.generation_task.done():
                     self.generation_task.cancel()
@@ -147,8 +155,8 @@ class Ming3RealtimeConnection(RealtimeConnection):
             session["audio"][side]["format"] = self._pcm_format(fmt)
         if session["audio"]["input"].get("turn_detection") is not None:
             raise ValueError("Ming3 Realtime uses manual turns; set audio.input.turn_detection to null")
-        controls = session.get("additional_information") or {}
-        if not isinstance(controls, dict):
+        controls = session.get("additional_information")
+        if controls is not None and not isinstance(controls, dict):
             raise ValueError("additional_information must be an object")
         await self._validate_voice(session)
         self._session = session
@@ -166,12 +174,33 @@ class Ming3RealtimeConnection(RealtimeConnection):
         controls = session.get("additional_information") or {}
         if controls.get("voice_mode") == "ip":
             return ("ip", controls.get("ip_name"))
-        selected = session["audio"]["output"].get("voice") or controls.get("voice_name") or controls.get("voice")
+        selected = session["audio"]["output"].get("voice")
+        if selected is None:
+            selected = controls.get("voice_name", controls.get("voice"))
+        references = {
+            key: controls[key]
+            for key in (
+                "ref_audio",
+                "reference_audio",
+                "prompt_wav",
+                "spk_emb",
+                "prompt_text",
+                "prompt_wav_lat",
+                "prompt_wav_emb",
+                "prompt_audio_mode",
+            )
+            if controls.get(key) is not None
+        }
+        if references:
+            fingerprint = hashlib.sha256(json.dumps(references, sort_keys=True).encode()).hexdigest()
+            return ("reference", voice_id(selected) if selected is not None else None, fingerprint)
         return ("reference", voice_id(selected) if selected is not None else None)
 
     async def _validate_voice(self, session):
         controls = session.get("additional_information") or {}
         selected = session["audio"]["output"].get("voice")
+        if selected is None:
+            selected = controls.get("voice_name", controls.get("voice"))
         key = self._voice_key(session)
         if self._audio_started and key != self._spoken_voice:
             raise ValueError("Voice cannot be changed after the session has emitted audio")
@@ -185,16 +214,23 @@ class Ming3RealtimeConnection(RealtimeConnection):
         if session.get("output_modalities") not in (["audio"], ["text"]):
             raise ValueError("output_modalities must be ['audio'] or ['text']")
         if selected is not None and controls.get("voice_mode") != "ip":
+            if any(controls.get(k) is not None for k in ("ref_audio", "reference_audio", "prompt_wav", "spk_emb")):
+                raise ValueError("Choose either a stored voice or reference audio/speaker embedding")
             selected = voice_id(selected)
             # Validate before acknowledging session.updated, including missing samples.
             await resolve_stored_voice(self.serving._ming3_speech_service, selected)
             session["audio"]["output"]["voice"] = selected
 
     async def _add_item(self, item):
+        if not isinstance(item, dict):
+            raise ValueError("item must be an object")
         if item.get("type") != "message" or item.get("role") not in {"user", "assistant", "system"}:
             raise ValueError("Only conversation message items are supported")
+        parts = item.get("content", [])
+        if not isinstance(parts, list) or not all(isinstance(part, dict) for part in parts):
+            raise ValueError("item.content must be an array of objects")
         content = []
-        for part in item.get("content", []):
+        for part in parts:
             if part.get("type") in {"input_text", "text"}:
                 content.append({"type": "text", "text": part["text"]})
             elif part.get("type") == "input_audio":
@@ -233,15 +269,17 @@ class Ming3RealtimeConnection(RealtimeConnection):
         resampler = None
         audio_output = session.get("output_modalities") != ["text"]
         common = {"response_id": response_id, "item_id": item_id, "output_index": 0, "content_index": 0}
-        await self.send_json({"type": "response.created", "response": {"id": response_id, "status": "in_progress"}})
+        messages = copy.deepcopy(self._messages)
+        history_index = len(self._messages)
         try:
+            self._response_started.set()
+            await self.send_json({"type": "response.created", "response": {"id": response_id, "status": "in_progress"}})
             if not self._is_model_validated:
                 raise ValueError("Send session.update before response.create")
             controls = dict(session.get("additional_information") or {})
             voice = session["audio"]["output"].get("voice")
             if voice is not None and controls.get("voice_mode") != "ip":
                 controls["voice_name"] = voice_id(voice)
-            messages = copy.deepcopy(self._messages)
             if session.get("instructions"):
                 messages.insert(0, {"role": "system", "content": session["instructions"]})
             request = ChatCompletionRequest(
@@ -310,8 +348,6 @@ class Ming3RealtimeConnection(RealtimeConnection):
             if resampler is not None:
                 tail = resampler.process(np.empty(0, dtype=np.float32), final=True)
                 sent_audio |= await self._emit_audio(tail, common, session)
-            if transcript:
-                self._messages.append({"role": "assistant", "content": transcript})
             if audio_output:
                 if not sent_audio:
                     raise ValueError("Audio generation completed without producing audio")
@@ -329,6 +365,9 @@ class Ming3RealtimeConnection(RealtimeConnection):
             status = "failed"
             await self.send_error(str(exc), "processing_error")
         finally:
+            # Keep the text already delivered to the client when a response is cancelled.
+            if transcript:
+                self._messages.insert(history_index, {"role": "assistant", "content": transcript})
             if result is not None and hasattr(result, "aclose"):
                 await result.aclose()
             if self._is_connected:

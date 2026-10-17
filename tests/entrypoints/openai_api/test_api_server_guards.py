@@ -1045,7 +1045,7 @@ async def test_pure_diffusion_speech_forwards_media_access_args(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("ming3", [False, True])
+@pytest.mark.parametrize("ming3", [False, True, "tts"])
 async def test_multistage_app_state_key_snapshot(monkeypatch, ming3) -> None:
     """Lock multi-stage ``app.state`` keys after init, including live vs None.
 
@@ -1074,12 +1074,14 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, ming3) -> None:
             pass
 
         def _has_ming3_talker_stage(self):
-            return ming3
+            return ming3 is True
 
         def warmup(self):
             return None
 
     class _FakeSpeech(_FakeCtor):
+        _tts_model_type = "ming3_audio_tts" if ming3 == "tts" else None
+
         async def warmup(self):
             return None
 
@@ -1117,7 +1119,10 @@ async def test_multistage_app_state_key_snapshot(monkeypatch, ming3) -> None:
         register.assert_awaited_once()
         assert register.call_args.args[0] is state.openai_serving_speech
         assert register.call_args.args[1] == _minimal_args().model
-        assert state.openai_serving_chat._ming3_speech_service is state.openai_serving_speech
+        if ming3 is True:
+            assert state.openai_serving_chat._ming3_speech_service is state.openai_serving_speech
+        else:
+            assert not hasattr(state.openai_serving_chat, "_ming3_speech_service")
     else:
         register.assert_not_awaited()
 

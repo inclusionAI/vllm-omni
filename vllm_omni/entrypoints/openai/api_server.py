@@ -1160,10 +1160,11 @@ async def omni_init_app_state(
         is not None,
     )
 
-    if (
+    has_ming3_chat = (
         state.openai_serving_chat is not None
         and getattr(state.openai_serving_chat, "_has_ming3_talker_stage", lambda: False)()
-    ):
+    )
+    if has_ming3_chat or getattr(state.openai_serving_speech, "_tts_model_type", None) == "ming3_audio_tts":
         from vllm_omni.entrypoints.openai.ming3_voices import register_model_voice_presets
 
         await register_model_voice_presets(
@@ -1172,7 +1173,8 @@ async def omni_init_app_state(
             revision=getattr(args, "revision", None),
             cache_dir=getattr(args, "download_dir", None),
         )
-        state.openai_serving_chat._ming3_speech_service = state.openai_serving_speech
+        if has_ming3_chat:
+            state.openai_serving_chat._ming3_speech_service = state.openai_serving_speech
 
     # Warm up speech pipeline (CUDA Graph capture, torch.compile) so the first
     # real user request is fast instead of paying a 100s compilation tax.
