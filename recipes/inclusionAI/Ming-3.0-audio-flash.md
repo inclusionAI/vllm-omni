@@ -75,6 +75,51 @@ vllm serve inclusionAI/Ming-3.0-audio-flash \
     --port 8091
 ```
 
+### Optional 128K and Tiny profiles
+
+Select these profiles explicitly with `--deploy-config`; adding the files does
+not change automatic profile selection. The Flash overlays inherit the matching
+base profile's execution mode, sampling controls and Talker configuration.
+
+| Profile | GPUs / Thinker TP | Thinker context | Prefill token budget | Default output limit |
+| --- | --- | --- | --- | --- |
+| `ming3_audio_flash_128k.yaml` | 4 / 4 | 131072 | 32768 | 65536 |
+| `ming3_audio_flash_asr_128k.yaml` | 4 / 4 | 131072 | 32768 | 32768 |
+| `ming3_audio_flash_thinker_only_128k.yaml` | 4 / 4 | 131072 | 32768 | 65536 |
+| `ming3_audio_tiny.yaml` | 1 / 1 | 131072 | 32768 | 65536 |
+| `ming3_audio_tiny_asr.yaml` | 1 / 1 | 131072 | 32768 | 65536 |
+| `ming3_audio_tiny_thinker_only.yaml` | 1 / 1 | 131072 | 32768 | 65536 |
+
+For example, select the full Flash 128K profile:
+
+```bash
+vllm serve inclusionAI/Ming-3.0-audio-flash --omni \
+    --deploy-config ming3_audio_flash_128k.yaml \
+    --served-model-name ming3-audio-flash --port 8091
+```
+
+The context limit includes input and generated positions. The output limit is a
+ceiling, not a target; set request `max_tokens` to the intended answer length.
+Long inputs and a larger prefill budget can increase compute and working memory.
+Validate memory capacity, warmup time and latency on the target GPUs; configuring
+128K does not establish full-length performance or quality.
+
+Tiny profiles require a compatible Tiny checkpoint, selected explicitly:
+
+```bash
+vllm serve /path/to/Ming-3.0-audio-tiny --omni \
+    --deploy-config ming3_audio_tiny.yaml \
+    --served-model-name ming3-audio-tiny --port 8091
+```
+
+They use the existing Ming3 pipeline and place both stages on GPU 0; the
+thinker-only variant omits the Talker. The Tiny
+ASR profile enables 10-gram repetition blocking and retains its own asynchronous
+execution settings, rather than copying the Flash ASR execution mode.
+These templates have configuration-resolution coverage, but have not been GPU
+validated with a Tiny checkpoint. Check the checkpoint's context support and
+single-GPU memory requirements before deployment.
+
 ## Transcribe with Chat Completions
 
 ```bash
@@ -174,7 +219,7 @@ jq -r '.choices[0].message.audio.data' response.json \
 - The talker emits mono 44.1 kHz audio.
 - Use Chat Completions for transcription; the `/v1/audio/transcriptions` endpoint is not currently available with `--omni`.
 - The model handles audio chunking internally, so the deployment configuration does not set `max_audio_clip_s` or `min_energy_split_window_size`.
-- Although the checkpoint advertises 131072 text positions, the provided deployment profiles cap the thinker `max_model_len` at 8192.
+- The default Flash profiles retain an 8192-token context limit. Select an explicit `*_128k.yaml` overlay for the larger limits documented above.
 
 ## Standalone text to speech
 
