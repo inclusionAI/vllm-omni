@@ -34,16 +34,15 @@ def test_markup_partition_independence(text, expected):
     assert strip_web_markup(text).strip() == " ".join(expected.split())
 
 
-@pytest.mark.parametrize("text", ["0", "こんにちは", "안녕하세요"])
-def test_unicode_and_numeric_terminal_tail_is_preserved(text):
+@pytest.mark.parametrize("text", ["こんにちは", "안녕하세요"])
+def test_unicode_terminal_tail_is_preserved(text):
     frontend = NativeMingTextFrontend()
     assert frontend.feed(text) == []
     fragments = frontend.feed("", final=True)
     assert fragments == [text + "."]
     normalized = normalize_native_fragment(fragments[0], tn_mode="legacy")
     assert normalized.strip()
-    if text != "0":
-        assert normalized.startswith(text)
+    assert normalized.startswith(text)
     with pytest.raises(ValueError, match="finalized"):
         frontend.feed("more")
 
@@ -84,3 +83,13 @@ def test_long_fragment_keeps_url_and_abbreviation_lexemes_intact():
     assert "Dr." in spoken
     assert "U.S.A." in spoken
     assert "example。" not in spoken
+
+
+def test_numeric_terminal_tail_does_not_gain_sentence_punctuation():
+    # A synthetic dot changes the acoustic realization of a short numeric
+    # answer. Preserve both bare numbers and punctuation supplied by the user.
+    for text in ("0", "12", "12.5", "-12.5", "0.", "12.5!", "12.5，"):
+        frontend = NativeMingTextFrontend()
+        for char in text:
+            assert frontend.feed(char) == []
+        assert frontend.feed("", final=True) == [text]

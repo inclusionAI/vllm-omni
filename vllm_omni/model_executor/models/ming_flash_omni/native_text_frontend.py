@@ -153,7 +153,11 @@ class NativeMingTextFrontend:
                 self.buffer = []
         if final:
             if self.buffer and any(char.isalnum() for token in self.buffer for char in token):
-                text = add_period(preprosess_text("".join(self.buffer)))
+                text = preprosess_text("".join(self.buffer))
+                # A bare numeric answer is already a complete utterance. An
+                # invented sentence dot can change the model's pronunciation.
+                if not re.fullmatch(r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)[。！？.!?，,；;：:、]*", text.strip()):
+                    text = add_period(text)
                 output.extend(cut_text_by_semantic_length(text, self.max_length))
             self.buffer = []
             self.finished = True
