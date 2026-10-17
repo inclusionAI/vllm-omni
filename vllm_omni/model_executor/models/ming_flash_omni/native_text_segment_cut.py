@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-# Ming speech segmentation; positions are omitted because audio needs only fragments.
+# Adapted from inclusionAI/Ming (MIT); see LICENSE.Ming and NOTICE.
+# https://github.com/inclusionAI/Ming/blob/e58533db227031990c5a6864dcf5f08fb53ed0d2/front/text_segment_cut.py
+# Positions are omitted because audio needs only fragments.
 import regex as re
 
 from .front_toolkit import PROTECTED_LEXEME

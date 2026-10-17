@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 # Author: wanren
-# Email: wanren.pj@antgroup.com
 # Date: 2025/10/16
 
 from pynini import Fst, escape, shortestpath
