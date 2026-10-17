@@ -3,6 +3,7 @@
 """Regression tests for Ming voice-preset registration."""
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -36,3 +37,28 @@ def test_register_accepts_inference_mode_speaker_embedding(tmp_path: Path, mocke
     [projected] = registry.registered["DB30"]["spk_emb"]
     assert projected.shape == (1, 4)
     assert not projected.requires_grad
+
+
+@pytest.mark.parametrize("strict", [False, True], ids=["ming2", "converted-ming3"])
+def test_weight_loading_registers_only_legacy_voice_presets(strict: bool, mocker: MockerFixture) -> None:
+    from vllm_omni.model_executor.models.ming_flash_omni import ming_flash_omni_talker as talker_module
+
+    talker = object.__new__(talker_module.MingFlashOmniTalkerForConditionalGeneration)
+    torch.nn.Module.__init__(talker)
+    talker.model = torch.nn.Linear(2, 2)
+    talker.audio_vae = torch.nn.Identity()
+    talker.config = SimpleNamespace(strict_weight_loading=strict)
+    talker._standalone = False
+    talker._vae_weight_source = None
+    talker.voice_presets = mocker.Mock()
+    loaded = set(dict(talker.named_parameters()))
+    mocker.patch.object(talker_module, "AutoWeightsLoader").return_value.load_weights.return_value = loaded
+
+    assert talker.load_weights([]) == loaded
+
+    if strict:
+        talker.voice_presets.load_presets_from_manifest.assert_not_called()
+    else:
+        talker.voice_presets.load_presets_from_manifest.assert_called_once_with(
+            device=talker.device, dtype=talker.dtype
+        )

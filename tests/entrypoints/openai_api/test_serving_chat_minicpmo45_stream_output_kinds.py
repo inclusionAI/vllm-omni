@@ -103,7 +103,7 @@ def test_shorter_sampling_params_list_does_not_raise(serving_chat):
 def test_ming3_sync_audio_waits_for_complete_thinker_text(serving_chat, async_chunk):
     thinker = _typed_stage("BailingMoeV3AudioForConditionalGeneration", "thinker")
     thinker.connector_config = SimpleNamespace(async_chunk=async_chunk)
-    serving_chat.engine_client = SimpleNamespace(stage_configs=[thinker, _stage("BailingTalker2", "ming_tts")])
+    serving_chat.engine_client = SimpleNamespace(stage_configs=[thinker, _stage("BailingTalker2", "ming3_tts")])
 
     out = serving_chat._fix_audio_stream_output_kinds(_delta_params(), ["text", "audio"])
 

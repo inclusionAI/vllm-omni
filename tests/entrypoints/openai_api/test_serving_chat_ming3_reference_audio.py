@@ -21,7 +21,7 @@ def _serving_chat() -> OmniOpenAIServingChat:
     chat.engine_client = SimpleNamespace(
         stage_configs=[
             {"engine_args": {"model_arch": "BailingMoeV3AudioForConditionalGeneration", "model_stage": "thinker"}},
-            {"engine_args": {"model_arch": "BailingTalker2", "model_stage": "ming_tts"}},
+            {"engine_args": {"model_arch": "BailingTalker2", "model_stage": "ming3_tts"}},
         ]
     )
     chat.model_config = SimpleNamespace(allowed_local_media_path="", allowed_media_domains=None)

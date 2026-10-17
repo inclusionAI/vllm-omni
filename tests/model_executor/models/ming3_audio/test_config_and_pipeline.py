@@ -409,7 +409,11 @@ def test_ming3_talker_bridge_uses_generated_text_and_default_voice(
     assert talker_input["prompt_token_ids"] == [0]
     assert info["ming_task"] == "omni"
     assert info["text"] == "abc def"
-    assert info["voice_name"] == "DB30"
+    assert info["voice_name"] is None
+    assert info["voice_mode"] == "reference"
+    assert Path(info["prompt_wav"]).is_file()
+    assert info["speaker_conditioning"] == "prompt"
+    assert "Target language: English." in info["prompt"]
     assert info["max_text_length"] == 42
 
 
@@ -433,13 +437,13 @@ def test_ming3_pipeline_supports_text_and_audio_outputs():
     assert thinker.sampling_constraints == {"detokenize": True}
 
     talker = pipeline.get_stage(1)
-    assert talker.model_stage == "ming_tts"
+    assert talker.model_stage == "ming3_tts"
     assert talker.model_arch == "BailingTalker2"
     assert talker.execution_type is StageExecutionType.LLM_GENERATION
     assert talker.input_sources == (0,)
     assert talker.final_output is True
     assert talker.final_output_type == "audio"
-    assert talker.tokenizer_subdir == "talker/llm"
+    assert talker.tokenizer_subdir == "llm"
     assert talker.sync_process_input_func == (
         f"{thinker2talker_token_only.__module__}.{thinker2talker_token_only.__name__}"
     )
@@ -451,7 +455,7 @@ def test_ming3_pipeline_supports_text_and_audio_outputs():
 def test_ming3_async_chunk_emits_stable_sentences_and_terminal_tail(mocker: MockerFixture):
     tokenizer = mocker.Mock(spec=["decode"])
     tokenizer.decode.side_effect = lambda ids, **kwargs: "".join(
-        {1: "你好", 2: "。", 3: "世界"}[token_id] for token_id in ids
+        {1: "这是一段包含足够多汉字的正常回答", 2: "。", 3: "世界"}[token_id] for token_id in ids
     )
     manager = mocker.Mock(spec=["_ming3_text_tokenizer", "_ming3_chunk_state"])
     manager._ming3_text_tokenizer = tokenizer
@@ -466,7 +470,7 @@ def test_ming3_async_chunk_emits_stable_sentences_and_terminal_tail(mocker: Mock
     request.all_token_ids = [99, 1, 2]
     first = thinker2talker_async_chunk(manager, None, request)
     assert first is not None
-    assert first.additional_information["text"] == "你好。"
+    assert first.additional_information["text"] == "这是一段包含足够多汉字的正常回答。"
     assert first.additional_information["ming_task"] == "omni"
     assert first.additional_information["voice_name"] == "lingguang"
     assert first.additional_information["max_text_length"] == 42
@@ -477,7 +481,7 @@ def test_ming3_async_chunk_emits_stable_sentences_and_terminal_tail(mocker: Mock
     request.all_token_ids = [99, 1, 2, 3]
     final = thinker2talker_async_chunk(manager, None, request, is_finished=True)
     assert final is not None
-    assert final.additional_information["text"] == "世界"
+    assert final.additional_information["text"] == "世界。"
     assert manager._ming3_chunk_state == {}
 
 
@@ -490,3 +494,19 @@ def test_ming_talker_reads_async_chunk_metadata():
     assert (
         MingFlashOmniTalkerForConditionalGeneration._extract_additional_info([info]) == info["additional_information"]
     )
+
+
+def test_ming3_standalone_tts_leaves_ming2_pipeline_unchanged():
+    ming2 = resolve_pipeline_config("ming_flash_omni_tts")
+    ming3 = resolve_pipeline_config("ming3_audio_tts")
+    assert ming2 is not None and ming3 is not None
+    old_stage = ming2.get_stage(0)
+    assert old_stage.model_stage == "ming_tts"
+    assert old_stage.hf_config_name == "talker_config"
+    assert old_stage.tokenizer_subdir == "talker/llm"
+    assert old_stage.model_path_resolver is None
+    new_stage = ming3.get_stage(0)
+    assert new_stage.model_stage == "ming3_tts"
+    assert new_stage.model_arch == "BailingTalker2"
+    assert new_stage.tokenizer_subdir == "llm"
+    assert new_stage.model_path_resolver is not None

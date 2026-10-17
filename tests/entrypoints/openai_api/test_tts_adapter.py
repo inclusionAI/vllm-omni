@@ -32,6 +32,7 @@ from vllm_omni.entrypoints.openai.tts_adapters.indextts2 import (
     IndexTTS25Adapter,
     indextts2_conditioning_cache_salt,
 )
+from vllm_omni.entrypoints.openai.tts_adapters.ming3_audio_tts import Ming3AudioTTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.ming_flash_omni_tts import MingFlashOmniTTSAdapter
 from vllm_omni.entrypoints.openai.tts_adapters.moss_tts import (
     MossTTSAdapter,
@@ -423,14 +424,13 @@ def test_ming_flash_omni_build_constructs_prepared_request():
     info = prepared.prompt["additional_information"]
     assert info["ming_task"] == "instruct"
     assert info["text"] == "hello"
-    assert info["voice_name"] is None
-    assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] == "test"
-    assert info["speaker_conditioning"] == "mute"
-    assert info["prompt_audio_mode"] == "none"
+    assert info["voice_name"] == "test"
+    assert "speaker_conditioning" not in info
+    assert "prompt_audio_mode" not in info
     assert prepared.model_type == "ming_flash_omni_tts"
 
 
-def test_ming_flash_omni_build_passes_base64_reference_audio():
+def test_ming3_build_passes_base64_reference_audio():
     class FakeServer:
         uploaded_speakers = {}
 
@@ -439,7 +439,7 @@ def test_ming_flash_omni_build_passes_base64_reference_audio():
             return [0.1, -0.1], 16000, "cache-key"
 
     server = FakeServer()
-    adapter = MingFlashOmniTTSAdapter(SimpleNamespace(server=server, engine_client=SimpleNamespace()))
+    adapter = Ming3AudioTTSAdapter(SimpleNamespace(server=server, engine_client=SimpleNamespace()))
     encoded = base64.b64encode(b"RIFFfakeWAVE").decode()
     request = OpenAICreateSpeechRequest(input="hello", ref_audio=encoded)
 
@@ -454,10 +454,43 @@ def test_ming_flash_omni_build_passes_base64_reference_audio():
     assert info["instruction"] is None
 
 
-def test_ming_flash_omni_rejects_mixed_ip_and_reference():
-    adapter = MingFlashOmniTTSAdapter(SimpleNamespace(server=SimpleNamespace(), engine_client=SimpleNamespace()))
+def test_ming3_rejects_mixed_ip_and_reference():
+    adapter = Ming3AudioTTSAdapter(SimpleNamespace(server=SimpleNamespace(), engine_client=SimpleNamespace()))
     request = OpenAICreateSpeechRequest(input="hello", voice="灵小柔", ref_audio="data:audio/wav;base64,AA==")
     assert "either" in adapter.validate(request)
+
+
+@pytest.mark.parametrize("voice", [None, "DB30"])
+def test_ming2_preserves_default_and_preset_voice(voice):
+    adapter = MingFlashOmniTTSAdapter(SpeechServingContext(server=SimpleNamespace(uploaded_speakers={})))
+    request = OpenAICreateSpeechRequest(input="hello", voice=voice)
+    assert adapter.validate(request) is None
+    prepared = asyncio.run(adapter.build(request, [], False))
+    info = prepared.prompt["additional_information"]
+    assert info["voice_name"] == voice
+    assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] is None
+    assert "speaker_conditioning" not in info
+    assert "prompt_audio_mode" not in info
+
+
+def test_ming2_rejects_new_reference_api():
+    adapter = MingFlashOmniTTSAdapter(SpeechServingContext(server=SimpleNamespace()))
+    request = OpenAICreateSpeechRequest(input="hello", ref_audio="data:audio/wav;base64,AA==")
+    assert "not yet supported" in adapter.validate(request)
+
+
+def test_ming3_tts_does_not_reinterpret_ip_voice_as_ming2_preset():
+    assert detect_tts_model_type("ming_tts", "MingFlashOmniTalkerForConditionalGeneration") == "ming_flash_omni_tts"
+    assert detect_tts_model_type("ming3_tts", "BailingTalker2") == "ming3_audio_tts"
+    adapter = Ming3AudioTTSAdapter(SpeechServingContext(server=SimpleNamespace(uploaded_speakers={})))
+    request = OpenAICreateSpeechRequest(input="hello", voice="DB30")
+    assert adapter.validate(request) is None
+    prepared = asyncio.run(adapter.build(request, [], False))
+    info = prepared.prompt["additional_information"]
+    assert info["voice_name"] is None
+    assert json.loads(info["instruction"])["audio_sequence"][0]["IP"] == "DB30"
+    assert info["speaker_conditioning"] == "mute"
+    assert prepared.model_type == "ming3_audio_tts"
 
 
 def test_step_audio2_build_constructs_open_assistant_turn():

@@ -668,6 +668,13 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             missing = set(dict(self.named_parameters())) - loaded
             if missing:
                 raise RuntimeError(f"Incomplete formal talker weights ({len(missing)} missing): {sorted(missing)[:20]}")
+        else:
+            # Ming2 presets depend on the loaded VAE and speaker projection.
+            # Converted Ming3 exports use per-request IP/reference conditioning.
+            try:
+                self.voice_presets.load_presets_from_manifest(device=self.device, dtype=self.dtype)
+            except (OSError, ValueError) as exc:
+                logger.warning("Voice preset loading failed (non-fatal): %s", exc)
 
         return loaded
 

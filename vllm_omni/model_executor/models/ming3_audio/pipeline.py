@@ -28,7 +28,7 @@ _THINKER_STAGE = StagePipelineConfig(
 
 _TALKER_STAGE = StagePipelineConfig(
     stage_id=1,
-    model_stage="ming_tts",
+    model_stage="ming3_tts",
     model_arch="BailingTalker2",
     execution_type=StageExecutionType.LLM_GENERATION,
     input_sources=(0,),
@@ -56,7 +56,33 @@ MING3_AUDIO_FLASH_THINKER_ONLY_PIPELINE = PipelineConfig(
     stages=(_THINKER_STAGE,),
 )
 
+
+# Converted Ming3 exports own their config and use per-request IP/clone controls.
+# Keep the legacy Ming2 standalone topology and preset semantics independent.
+MING3_AUDIO_TTS_PIPELINE = PipelineConfig(
+    model_type="ming3_audio_tts",
+    default_deploy_config_name="ming3_audio_tts.yaml",
+    model_arch="BailingTalker2",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="ming3_tts",
+            model_arch="BailingTalker2",
+            execution_type=StageExecutionType.LLM_GENERATION,
+            input_sources=(),
+            final_output=True,
+            final_output_type="audio",
+            owns_tokenizer=True,
+            engine_output_type="audio",
+            tokenizer_subdir="llm",
+            model_path_resolver="vllm_omni.model_executor.models.ming_flash_omni.checkpoint.resolve_ming_talker_checkpoint",
+        ),
+    ),
+)
+
+
 __all__ = [
     "MING3_AUDIO_FLASH_PIPELINE",
+    "MING3_AUDIO_TTS_PIPELINE",
     "MING3_AUDIO_FLASH_THINKER_ONLY_PIPELINE",
 ]

@@ -7,11 +7,9 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 from functools import cached_property
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import soundfile as sf
@@ -59,62 +57,6 @@ class VoicePresetRegistry:
 
         self.registered: dict[str, dict[str, Any]] = {}
         self._reference_cache: dict[tuple, dict[str, Any]] = {}
-        self._antoc_cache_hits = 0
-
-    def _load_antoc_reference_cache(
-        self,
-        paths: list[str],
-        *,
-        device: torch.device,
-        dtype: torch.dtype,
-        need_speaker: bool,
-        need_latents: bool,
-    ) -> dict[str, Any] | None:
-        """Read AntOC's seed-1234 prompt features without recomputing the VAE posterior."""
-        cache_root = os.environ.get("MING_TTS_ANTOC_PROMPT_CACHE_DIR")
-        if not cache_root:
-            return None
-        key = hashlib.md5("|".join(paths).encode()).hexdigest()[:16]
-        cache_path = Path(cache_root) / f"{key}.pt"
-        if not cache_path.is_file():
-            raise FileNotFoundError(f"AntOC prompt cache entry missing: {cache_path}")
-        payload = torch.load(cache_path, map_location="cpu", weights_only=True)
-        if not isinstance(payload, dict):
-            raise ValueError(f"Invalid AntOC prompt cache entry: {cache_path}")
-
-        latents = projected = None
-        if need_latents:
-            latents = payload.get("prompt_wav_lat")
-            if (
-                not isinstance(latents, torch.Tensor)
-                or latents.ndim != 3
-                or latents.shape[0] != 1
-                or latents.shape[-1] != self._audio_vae.config.dec_kwargs["latent_dim"]
-                or latents.shape[1] % self._patch_size
-                or not torch.isfinite(latents).all()
-            ):
-                raise ValueError(f"Invalid AntOC prompt latent: {cache_path}")
-            latents = latents.to(device=device, dtype=dtype)
-            patches = latents.reshape(-1, self._patch_size, latents.shape[-1])
-            projected = self._aggregator(patches).reshape(1, -1, self._spk_head.out_features)
-
-        embeddings = []
-        if need_speaker:
-            raw_speakers = payload.get("raw_se")
-            if not isinstance(raw_speakers, list) or len(raw_speakers) != len(paths):
-                raise ValueError(f"Invalid AntOC speaker cache entry: {cache_path}")
-            for raw in raw_speakers:
-                if (
-                    not isinstance(raw, torch.Tensor)
-                    or raw.shape != (1, self._spk_head.in_features)
-                    or not torch.isfinite(raw).all()
-                ):
-                    raise ValueError(f"Invalid AntOC speaker embedding: {cache_path}")
-                embeddings.append(self._spk_head(raw.to(device=device, dtype=dtype)))
-        self._antoc_cache_hits += 1
-        if self._antoc_cache_hits == 1:
-            logger.info("Reading AntOC prompt features from %s", cache_root)
-        return {"spk_emb": embeddings, "prompt_wav_lat": latents, "prompt_wav_emb": projected}
 
     @torch.no_grad()
     def resolve_reference(
@@ -127,7 +69,7 @@ class VoicePresetRegistry:
         need_latents: bool,
         reference_audio: list[dict] | None = None,
     ) -> dict[str, Any]:
-        """Resolve AntOC reference audio, extracting only the requested features."""
+        """Resolve reference audio, extracting only the requested features."""
         from torchaudio.functional import resample as resample_reference
 
         cache_key = None
@@ -136,14 +78,6 @@ class VoicePresetRegistry:
             cache_key = (tuple((p, os.stat(p).st_mtime_ns) for p in paths), need_speaker, need_latents)
             if cache_key in self._reference_cache:
                 return self._reference_cache[cache_key]
-            cached = self._load_antoc_reference_cache(
-                paths, device=device, dtype=dtype, need_speaker=need_speaker, need_latents=need_latents
-            )
-            if cached is not None:
-                if len(self._reference_cache) >= 16:
-                    self._reference_cache.pop(next(iter(self._reference_cache)))
-                self._reference_cache[cache_key] = cached
-                return cached
             reference_audio = []
             for path in paths:
                 data, sr = sf.read(path, dtype="float32")

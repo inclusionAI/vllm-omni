@@ -86,6 +86,7 @@ from vllm_omni.model_executor.models.mimo_audio.pipeline import MIMO_AUDIO_PIPEL
 from vllm_omni.model_executor.models.ming3_audio.pipeline import (
     MING3_AUDIO_FLASH_PIPELINE,
     MING3_AUDIO_FLASH_THINKER_ONLY_PIPELINE,
+    MING3_AUDIO_TTS_PIPELINE,
 )
 from vllm_omni.model_executor.models.ming_flash_omni.pipeline import (
     MING_FLASH_OMNI_IMAGE_PIPELINE,
@@ -198,6 +199,7 @@ OMNI_PIPELINES: dict[str, PipelineConfig | PipelineResolverFunc] = {
     "ming_flash_omni_image": MING_FLASH_OMNI_IMAGE_PIPELINE,
     "ming_image": MING_IMAGE_PIPELINE,
     "bailing_moe_v3_audio": MING3_AUDIO_FLASH_PIPELINE,
+    "ming3_audio_tts": MING3_AUDIO_TTS_PIPELINE,
     "bailing_moe_v3_audio_thinker_only": MING3_AUDIO_FLASH_THINKER_ONLY_PIPELINE,
     "moss_tts_nano": MOSS_TTS_NANO_PIPELINE,
     "minimax_h3_disaggregated": MINIMAX_H3_PIPELINE,

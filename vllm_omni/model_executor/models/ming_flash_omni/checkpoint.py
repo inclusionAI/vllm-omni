@@ -39,8 +39,9 @@ def prepare_talker_checkpoint(source: str, cache_dir: str | None = None) -> str:
         strict_weight_loading=True,
         max_decode_steps=1000,
         max_cache_len=2304,
-        # Keep AntOC text handling; use native cached VAE decoding by default.
+        # Converted exports retain their text frontend; use cached VAE decoding by default.
         normalize_text=False,
+        scrub_markup=True,
         duration_limit=False,
         stream_decode=True,
         # None follows native Ming: trim full output, retain streaming chunks.
@@ -74,13 +75,21 @@ def prepare_talker_checkpoint(source: str, cache_dir: str | None = None) -> str:
 
 
 def resolve_ming_talker_checkpoint(model: str, revision: str | None, task_type: str | None) -> str:
-    """Resolve an OSS deploy/ URI or a local copy of that exact layout."""
-    del revision, task_type
-    source = os.environ.get("MING_TTS_MODEL_PATH") or model
-    if source.startswith("oss://"):
-        from .oss_checkpoint import download_oss_talker
+    """Resolve a converted Ming3 export from a local directory or Hub snapshot."""
+    del task_type
+    if "://" in model:
+        raise ValueError("Ming3 TTS expects a local directory or a Hugging Face Hub model ID")
+    source = model
+    if not Path(source).is_dir():
+        if Path(source).is_absolute() or source.startswith(("./", "../", "~")):
+            raise FileNotFoundError(f"Ming3 TTS checkpoint directory does not exist: {source}")
+        from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
-        source = download_oss_talker(source)
-    elif not Path(source).is_dir():
-        raise ValueError("Ming TTS expects an oss:// deploy/ URI or a local deploy/ directory")
+        source = download_weights_from_hf_specific(
+            model_name_or_path=model,
+            cache_dir=None,
+            allow_patterns=["config.json", "talker/**"],
+            revision=revision,
+            require_all=True,
+        )
     return prepare_talker_checkpoint(source)

@@ -278,7 +278,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         stages = getattr(self.engine_client, "stage_configs", []) or []
         metadata = [self._stage_model_metadata(stage) for stage in stages]
         return any(arch == "BailingMoeV3AudioForConditionalGeneration" for arch, _ in metadata) and any(
-            model_stage == "ming_tts" for _, model_stage in metadata
+            model_stage == "ming3_tts" for _, model_stage in metadata
         )
 
     async def _attach_ming3_reference_audio(self, engine_prompt: TokPrompt) -> None:

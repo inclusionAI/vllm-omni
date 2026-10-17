@@ -78,9 +78,9 @@ MING_FLASH_OMNI_TTS_PIPELINE = PipelineConfig(
             final_output=True,
             final_output_type="audio",
             owns_tokenizer=True,
+            hf_config_name="talker_config",
             engine_output_type="audio",
-            tokenizer_subdir="llm",
-            model_path_resolver="vllm_omni.model_executor.models.ming_flash_omni.checkpoint.resolve_ming_talker_checkpoint",
+            tokenizer_subdir="talker/llm",
         ),
     ),
 )
