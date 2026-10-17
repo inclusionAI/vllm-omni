@@ -4,9 +4,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
-import regex as re
 import torch
 from vllm.inputs import TextPrompt
 from vllm.tokenizers import cached_tokenizer_from_config
@@ -15,11 +15,11 @@ from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.ming_flash_omni.native_text_frontend import NativeMingTextFrontend
 
 from .ming_talker import (
     build_ming_talker_additional_info,
     build_ming_talker_inputs,
-    strip_language_tag,
 )
 
 
@@ -32,28 +32,13 @@ def thinker2talker_token_only(
     return build_ming_talker_inputs(source_outputs, prompt)
 
 
-_SENTENCE_END = re.compile(r"[。！？!?]|(?<!\d)\.(?!\d)")
-_PROTECTED_SENTENCE_TEXT = re.compile(
-    r"https?://[^\s。！？]+|\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr)\.|\b(?:[A-Za-z]\.)+[A-Za-z]?",
-    re.IGNORECASE,
-)
-_CLOSING_PUNCTUATION = frozenset("\"'”’）】")
-
-
-def _ready_sentence_end(text: str, start: int) -> int | None:
-    """Return the last stable sentence boundary after ``start``."""
-    end = None
-    protected = list(_PROTECTED_SENTENCE_TEXT.finditer(text))
-    for match in _SENTENCE_END.finditer(text, start):
-        if any(span.start() <= match.start() < span.end() for span in protected):
-            continue
-        # The next token may turn a trailing period into an abbreviation or URL.
-        if match.group() == "." and match.end() == len(text):
-            continue
-        end = match.end()
-        while end < len(text) and text[end] in _CLOSING_PUNCTUATION:
-            end += 1
-    return end
+@dataclass
+class _MingChunkState:
+    frontend: NativeMingTextFrontend
+    max_length: int
+    scrub_markup: bool
+    prefix: str = ""
+    synthesis_info: dict[str, Any] | None = None
 
 
 def thinker2talker_async_chunk(
@@ -62,10 +47,10 @@ def thinker2talker_async_chunk(
     request: OmniEngineCoreRequest,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
-    """Send stable thinker sentences to Ming's self-contained talker.
+    """Preprocess stable thinker deltas before handing fragments to the talker.
 
-    The talker retokenizes each sentence; no thinker hidden-state transport is needed.
-    Full token history is requested explicitly for the v2 data plane.
+    Frontend state is local to this request and is cleaned up by the existing
+    transport cleanup paths. No model-specific receiver protocol is required.
     """
     del multimodal_output
     request_id = request.external_req_id
@@ -73,7 +58,21 @@ def thinker2talker_async_chunk(
     if states is None:
         states = {}
         transfer_manager._ming3_chunk_state = states
-    state = states.setdefault(request_id, "")
+    controls = deserialize_additional_information(request.additional_information)
+    max_length = int(controls.get("max_text_length", 50))
+    scrub_markup = controls.get("scrub_markup", True)
+    if not isinstance(scrub_markup, bool):
+        raise ValueError("scrub_markup must be a boolean")
+    state = states.get(request_id)
+    if state is None:
+        state = _MingChunkState(
+            frontend=NativeMingTextFrontend(max_length, scrub_markup=scrub_markup),
+            max_length=max_length,
+            scrub_markup=scrub_markup,
+        )
+        states[request_id] = state
+    elif state.max_length != max_length or state.scrub_markup != scrub_markup:
+        raise ValueError("max_text_length and scrub_markup cannot change within a Ming text stream")
 
     token_ids = list(request.all_token_ids)[len(request.prompt_token_ids) :]
     model_config = getattr(transfer_manager, "model_config", None) or getattr(transfer_manager, "config", None)
@@ -86,37 +85,42 @@ def thinker2talker_async_chunk(
             raise RuntimeError("Ming3 async chunk requires the thinker tokenizer")
         transfer_manager._ming3_text_tokenizer = tokenizer
     text = tokenizer.decode(token_ids, skip_special_tokens=True)
-    if not text.startswith(state):
-        raise RuntimeError("Ming3 thinker text changed after an audio sentence was emitted")
+    if not text.startswith(state.prefix):
+        raise RuntimeError("Ming3 thinker text changed after a text delta was consumed")
 
-    end = len(text) if is_finished else _ready_sentence_end(text, len(state))
-    if end is None:
-        return None
-    chunk = text[len(state) : end]
-    states[request_id] = text[:end]
+    # Byte-level tokens can temporarily decode to U+FFFD. Feed only stable
+    # UTF-8 text; the final snapshot still flushes the frontend when empty.
+    end = len(text) if is_finished else text.find("\ufffd", len(state.prefix))
+    if end < 0:
+        end = len(text)
+    delta = text[len(state.prefix) : end]
+    state.prefix = text[:end]
+    fragments = state.frontend.feed(delta, final=is_finished)
     if is_finished:
         states.pop(request_id, None)
-    # The transcribe-format thinker prefixes its stream with a `<lang>\t`
-    # tag (metadata for text responses). Strip it from the first chunk only
-    # after the raw prefix-consistency state above has been advanced, so it
-    # is never read aloud while `text.startswith(state)` stays intact.
-    chunk = strip_language_tag(chunk.lstrip()).strip()
-    if not chunk:
+    if not fragments and not is_finished:
         return None
 
+    spoken_text = "".join(fragments)
+    if state.synthesis_info is None:
+        # Language-dependent prompt and automatic IP selection are locked by
+        # the first speakable fragment, rather than reselected for every chunk.
+        info = build_ming_talker_additional_info(spoken_text, controls)
+        if fragments:
+            state.synthesis_info = info
+    else:
+        info = dict(state.synthesis_info)
+    info.update(text=spoken_text, ming_text_fragments=fragments)
     return OmniPayloadStruct(
-        # The generation runner needs a nonempty prompt to execute this chunk.
-        codes=CodesStruct(audio=torch.tensor([0], dtype=torch.long)),
-        additional_information=build_ming_talker_additional_info(
-            chunk, deserialize_additional_information(request.additional_information)
-        ),
+        codes=CodesStruct(audio=torch.tensor([0] if fragments else [], dtype=torch.long)),
+        additional_information=info,
         meta=MetaStruct(replace_runtime_additional_information=True),
     )
 
 
 # Opt into dispatch on every decode step, even without an inter-stage payload.
 # The v2 data plane also keeps the full token history for each snapshot,
-# since sentence segmentation decodes the complete generated prefix on every step.
+# since the frontend consumes deltas from each complete generated prefix.
 setattr(thinker2talker_async_chunk, "_requires_full_token_history", True)
 
 

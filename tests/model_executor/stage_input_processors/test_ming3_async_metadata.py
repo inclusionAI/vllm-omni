@@ -34,62 +34,90 @@ def _request(text: str, info=None) -> OmniEngineCoreRequest:
     )
 
 
-def test_async_preserves_explicit_talker_controls():
+def test_async_preserves_serialized_talker_controls():
     controls = {
         "tn_mode": "upstream",
-        "normalize_text": True,
+        "normalize_text": False,
+        "scrub_markup": True,
         "stream_decode": False,
         "seed": 123,
         "voice_mode": "ip",
         "ip_name": "灵小柔",
     }
     info = serialize_additional_information(controls)
-    output = thinker2talker_async_chunk(_manager(), None, _request("Chinese\t你好。", info))
-
+    output = thinker2talker_async_chunk(_manager(), None, _request("Chinese\t你好。", info), is_finished=True)
     assert output is not None
     assert output.additional_information["text"] == "你好。"
+    assert output.additional_information["ming_text_fragments"] == ["你好。"]
     for key, value in controls.items():
         assert output.additional_information[key] == value
 
 
-def test_terminal_language_only_chunk_is_not_sent():
+@pytest.mark.parametrize("text", ["  Chinese\t  ", "<script>secret()</script>"])
+def test_empty_terminal_still_completes_and_cleans_request_state(text):
     manager = _manager()
-    assert thinker2talker_async_chunk(manager, None, _request("  Chinese\t  "), is_finished=True) is None
+    output = thinker2talker_async_chunk(manager, None, _request(text), is_finished=True)
+    assert output is not None
+    assert output.codes.audio.numel() == 0
+    assert output.additional_information["ming_text_fragments"] == []
     assert manager._ming3_chunk_state == {}
 
 
 def test_raw_prefix_state_survives_language_stripping_and_terminal_tail():
     manager = _manager()
-    first_text = "Chinese\t你好。"
+    first_text = "Chinese\t这里是一段超过十二个字的正常回答。"
     first = thinker2talker_async_chunk(manager, None, _request(first_text))
     assert first is not None
-    assert first.additional_information["text"] == "你好。"
-    assert manager._ming3_chunk_state["request"] == first_text
+    assert first.additional_information["text"] == first_text.split("\t", 1)[1]
+    assert manager._ming3_chunk_state["request"].prefix == first_text
     assert thinker2talker_async_chunk(manager, None, _request(first_text)) is None
-
     final = thinker2talker_async_chunk(manager, None, _request(first_text + "剩余文字"), is_finished=True)
     assert final is not None
-    assert final.additional_information["text"] == "剩余文字"
+    assert final.additional_information["text"] == "剩余文字。"
     assert manager._ming3_chunk_state == {}
 
 
 def test_incremental_input_keeps_numeric_url_and_abbreviation_context():
     text = "Dr. Smith gave e.g. 日期2026.10.16，金额12.5元，IP192.168.1.1，https://example.com/path?a=1 这个例子!"
+    complete = thinker2talker_async_chunk(_manager(), None, _request(text), is_finished=True)
     manager = _manager()
-    for length in range(1, len(text)):
-        assert thinker2talker_async_chunk(manager, None, _request(text[:length])) is None
-    output = thinker2talker_async_chunk(manager, None, _request(text))
-    assert output is not None
-    assert output.additional_information["text"] == text
-
-
-def test_english_period_waits_for_lookahead_and_final_period_flushes():
-    manager = _manager()
-    assert thinker2talker_async_chunk(manager, None, _request("Hello.")) is None
-    first = thinker2talker_async_chunk(manager, None, _request("Hello. Next"))
-    assert first is not None
-    assert first.additional_information["text"] == "Hello."
-    final = thinker2talker_async_chunk(manager, None, _request("Hello. Next."), is_finished=True)
-    assert final is not None
-    assert final.additional_information["text"] == "Next."
+    fragments = []
+    for length in range(1, len(text) + 1):
+        output = thinker2talker_async_chunk(manager, None, _request(text[:length]))
+        if output is not None:
+            fragments.extend(output.additional_information["ming_text_fragments"])
+    final = thinker2talker_async_chunk(manager, None, _request(text), is_finished=True)
+    fragments.extend(final.additional_information["ming_text_fragments"])
+    assert fragments == complete.additional_information["ming_text_fragments"]
     assert manager._ming3_chunk_state == {}
+
+
+def test_prompt_and_automatic_ip_remain_stable_after_first_speakable_fragment():
+    manager = _manager()
+    controls = serialize_additional_information({"voice_mode": "ip"})
+    text = "This is a long enough answer with many ordinary English words for speech!"
+    first = thinker2talker_async_chunk(manager, None, _request(text, controls))
+    assert first is not None
+    final = thinker2talker_async_chunk(
+        manager, None, _request(text + "接下来换成中文回答。", controls), is_finished=True
+    )
+    assert first.additional_information["ip_name"] == "US_Stella"
+    assert final.additional_information["ip_name"] == "US_Stella"
+    assert first.additional_information["prompt"] == final.additional_information["prompt"]
+
+
+@pytest.mark.parametrize("override", [{"scrub_markup": False}, {"max_text_length": 5}])
+def test_frontend_controls_cannot_change_mid_stream(override):
+    manager = _manager()
+    assert thinker2talker_async_chunk(manager, None, _request("等待足够的文字")) is None
+    with pytest.raises(ValueError, match="cannot change"):
+        thinker2talker_async_chunk(
+            manager, None, _request("等待足够的文字。", serialize_additional_information(override))
+        )
+
+
+def test_incomplete_utf8_is_not_committed_as_spoken_text():
+    manager = _manager()
+    assert thinker2talker_async_chunk(manager, None, _request("你好\ufffd")) is None
+    output = thinker2talker_async_chunk(manager, None, _request("你好世界"), is_finished=True)
+    assert output.additional_information["text"] == "你好世界。"

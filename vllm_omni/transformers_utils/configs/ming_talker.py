@@ -33,6 +33,7 @@ class MingFlashOmniTalkerConfig(PretrainedConfig):
         max_cache_len: int = 2048,
         strict_weight_loading: bool = False,
         normalize_text: bool = True,
+        scrub_markup: bool = False,
         tn_mode: str = "legacy",
         duration_limit: bool = True,
         stream_decode: bool = True,
@@ -53,6 +54,7 @@ class MingFlashOmniTalkerConfig(PretrainedConfig):
         self.max_cache_len = max_cache_len
         self.strict_weight_loading = strict_weight_loading
         self.normalize_text = normalize_text
+        self.scrub_markup = scrub_markup
         self.tn_mode = tn_mode
         self.duration_limit = duration_limit
         self.stream_decode = stream_decode

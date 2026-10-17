@@ -9,10 +9,10 @@
 
 from __future__ import annotations
 
-import re
 import string
 from typing import Any
 
+import regex as re
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -47,12 +47,10 @@ def _get_upstream_tn() -> Any | None:
         except Exception as exc:  # pragma: no cover - environment-dependent
             _UPSTREAM_TN_ERROR = f"{type(exc).__name__}: {exc}"
             logger.warning(
-                "Upstream TalkerTN unavailable (%s); "
-                "tn_mode='upstream' degrades to English-only normalize_numbers",
+                "Upstream TalkerTN unavailable (%s); tn_mode='upstream' degrades to English-only normalize_numbers",
                 _UPSTREAM_TN_ERROR,
             )
     return _UPSTREAM_TN if _UPSTREAM_TN_READY else None
-
 
 
 def get_semantic_length(text: str) -> int:

@@ -73,3 +73,64 @@ def test_upstream_resources_and_bilingual_number_normalization():
     assert "2026" not in result
     result = " ".join(text_processing.segment_and_normalize("I have 12 apples.", tn_mode="upstream"))
     assert "twelve" in result.lower()
+
+
+def test_markup_control_is_independent_and_preserves_legacy_defaults():
+    legacy = MingFlashOmniTalkerConfig()
+    converted = MingFlashOmniTalkerConfig(scrub_markup=True)
+    assert resolve_generation_params({}, legacy).scrub_markup is False
+    assert resolve_generation_params({"normalize_text": False}, converted).scrub_markup is True
+    assert resolve_generation_params({"scrub_markup": False}, converted).scrub_markup is False
+    info = build_ming_talker_additional_info("text", {"scrub_markup": False})
+    assert info["scrub_markup"] is False
+    with pytest.raises(ValueError, match="scrub_markup"):
+        resolve_generation_params({"scrub_markup": "false"}, converted)
+
+
+@pytest.mark.parametrize("normalize", [False, True])
+def test_native_fragments_are_normalized_once_without_receiver_resegmentation(mocker, normalize):
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.models.ming_flash_omni import ming_flash_omni_talker as talker
+
+    model = mocker.Mock()
+    model._project_spk_emb.return_value = None
+    model.audio_generator.generate_latents.return_value = []
+    model.audio_generator.duration_capped_steps.return_value = 4
+    normalizer = mocker.patch.object(talker, "normalize_native_fragment", side_effect=lambda text, *args, **kw: text)
+    resegment = mocker.patch.object(talker, "segment_and_normalize")
+    build_input = mocker.patch.object(talker, "build_tts_input", return_value=(torch.empty(0), None))
+    voice = SimpleNamespace(
+        spk_emb=None, already_projected=False, prompt_text=None, prompt_wav_emb=None, prompt_wav_lat=None
+    )
+    params = resolve_generation_params({"normalize_text": normalize}, MingFlashOmniTalkerConfig())
+    result = talker.MingFlashOmniTalkerForConditionalGeneration._generate_latents(
+        model,
+        input_ids=torch.tensor([0]),
+        inputs_embeds=None,
+        text="原始文本",
+        params=params,
+        voice=voice,
+        native_fragments=["第一段。", "第二段。"],
+    )
+    assert result == []
+    assert normalizer.call_count == (2 if normalize else 0)
+    assert [call.kwargs["text"] for call in build_input.call_args_list] == ["第一段。", "第二段。"]
+    resegment.assert_not_called()
+    model.reset_mock()
+    assert (
+        talker.MingFlashOmniTalkerForConditionalGeneration._generate_latents(
+            model,
+            input_ids=torch.tensor([0]),
+            inputs_embeds=None,
+            text="",
+            params=params,
+            voice=voice,
+            native_fragments=[],
+        )
+        == []
+    )
+    model.audio_generator.generate_latents.assert_not_called()
+    model.model.get_input_embeddings.assert_not_called()

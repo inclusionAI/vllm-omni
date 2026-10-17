@@ -33,6 +33,7 @@ from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.transformers_utils.configs.ming_talker import MingFlashOmniTalkerConfig
 
+from .native_text_frontend import normalize_native_fragment
 from .streaming import MingStreamingJob
 from .talker_module import CFM, DiT, MingAudioGenerator, build_tts_input
 from .text_processing import segment_and_normalize
@@ -338,6 +339,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                 text=additional_info.get("text", ""),
                 params=params,
                 voice=voice,
+                native_fragments=additional_info.get("ming_text_fragments"),
             )
             return self._decode_to_output(
                 latents, stream_decode=params.stream_decode, trim_silence=params.trim_trailing_silence
@@ -376,6 +378,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                         params=params,
                         voice=voice,
                         on_latent=on_latent,
+                        native_fragments=info.get("ming_text_fragments"),
                     )
 
             job = MingStreamingJob(produce, self.audio_vae, self.device)
@@ -540,6 +543,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         params: _GenerationParams,
         voice: _VoiceContext,
         on_latent=None,
+        native_fragments: list[str] | None = None,
     ) -> list[torch.Tensor]:
         generator = self.audio_generator
 
@@ -559,15 +563,33 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             )
 
         spk_emb = self._project_spk_emb(voice.spk_emb, voice.already_projected, params.use_zero_spk_emb)
-        text_segments = (
-            (
-                segment_and_normalize(text, max_length=params.max_text_length, tn_mode=params.tn_mode)
+        if native_fragments is not None:
+            # Producer-side fragments were already scrubbed and segmented.
+            # Linguistic normalization must run exactly once, without splitting
+            # the same fragment again at receiver-dependent boundaries.
+            text_segments = [
+                normalize_native_fragment(segment, params.prompt, tn_mode=params.tn_mode)
                 if params.normalize_text
+                else segment
+                for segment in native_fragments
+            ]
+            text_segments = [segment for segment in text_segments if segment.strip()]
+            if not text_segments:
+                return []
+        else:
+            if text and params.scrub_markup:
+                from .front_toolkit import strip_web_markup
+
+                text = strip_web_markup(text)
+                if not any(char.isalnum() for char in text):
+                    raise ValueError("Ming frontend emitted no speakable text after markup removal")
+            text_segments = (
+                segment_and_normalize(text, max_length=params.max_text_length, tn_mode=params.tn_mode)
+                if text and params.normalize_text
                 else [text]
+                if text
+                else []
             )
-            if text
-            else []
-        )
 
         if not text_segments:
             # vLLM passes 1D input_ids; Qwen2Model expects (batch, seq).

@@ -24,6 +24,7 @@ The thinker runs with TP=4 and the talker is colocated on GPU 3.
 vllm serve inclusionAI/Ming-3.0-audio-flash \
     --omni \
     --deploy-config vllm_omni/deploy/ming3_audio_flash.yaml \
+    --served-model-name ming3-audio-flash \
     --port 8091
 ```
 
@@ -32,7 +33,7 @@ vllm serve inclusionAI/Ming-3.0-audio-flash \
 
 ### 2 x H200
 
-For two H200 GPUs, use the validated TP=2 deployment configuration:
+For two H200 GPUs, the following example selects TP=2:
 
 Example ming3_audio_flash_2gpu_h200.yaml
 
@@ -58,6 +59,7 @@ vllm serve /path/to/inclusionAI/Ming-3.0-audio-flash \
     --deploy-config vllm_omni/deploy/ming3_audio_flash_2gpu_h200.yaml \
     --init-timeout 1800 \
     --stage-init-timeout 1800 \
+    --served-model-name ming3-audio-flash \
     --port 8091
 ```
 
@@ -69,6 +71,7 @@ When the service only needs ASR or Speech QA text, avoid loading the talker:
 vllm serve inclusionAI/Ming-3.0-audio-flash \
     --omni \
     --deploy-config vllm_omni/deploy/ming3_audio_flash_thinker_only.yaml \
+    --served-model-name ming3-audio-flash \
     --port 8091
 ```
 
@@ -78,7 +81,7 @@ vllm serve inclusionAI/Ming-3.0-audio-flash \
 curl http://localhost:8091/v1/chat/completions \
     -H "Content-Type: application/json" \
     -d '{
-      "model": "/path/to/inclusionAI/Ming-3.0-audio-flash",
+      "model": "ming3-audio-flash",
       "messages": [{
         "role": "user",
         "content": [
@@ -107,7 +110,7 @@ Example inputs:
 ```bash
 MING3_AUDIO_FILE=/path/to/inclusionAI/Ming-3.0-audio-flash/examples/audio_files/introduce_ant_group.wav
 base64 -w0 "$MING3_AUDIO_FILE" | jq -Rs '{
-  model: "/path/to/inclusionAI/Ming-3.0-audio-flash",
+  model: "ming3-audio-flash",
   messages: [
     {
       role: "system",
@@ -131,11 +134,11 @@ base64 -w0 "$MING3_AUDIO_FILE" | jq -Rs '{
 
 ## Speak the answer
 
-Using the `DB30` Talker preset (by default). The two stages stay loaded in the service.
+Select an explicit IP voice for a repeatable comparison. The two stages stay loaded in the service.
 
 ```bash
 base64 -w0 "$MING3_AUDIO_FILE" | jq -Rs '{
-  model: "/path/to/inclusionAI/Ming-3.0-audio-flash",
+  model: "ming3-audio-flash",
   messages: [
     {
       role: "system",
@@ -150,7 +153,7 @@ base64 -w0 "$MING3_AUDIO_FILE" | jq -Rs '{
     }
   ],
   modalities: ["text", "audio"],
-  additional_information: {voice_name: "DB30"},
+  additional_information: {voice_mode: "ip", ip_name: "灵小柔"},
   temperature: 0,
   max_tokens: 128
 }' | curl --fail-with-body http://localhost:8091/v1/chat/completions \
@@ -165,8 +168,36 @@ jq -r '.choices[0].message.audio.data' response.json \
 
 - The response format is `language<TAB>transcription`. Clients that need only the transcript can split the returned text at the first tab.
 - Speech QA returns a direct answer rather than a transcript. It uses Chat Completions and is not passed through the ASR language-prefix postprocessor.
-- The current `talker/data/voice_name.json` provides `DB30` and `lingguang`. `DB30` is the default; set `additional_information.voice_name` explicitly to select a preset, or to `null` for the zero-speaker-embedding fallback.
+- Ming3 IP voices use `additional_information: {"voice_mode": "ip", "ip_name": "灵小柔"}`. IP captions and Ming2 registered presets such as `DB30` are different controls.
+- Ming3 reference mode accepts per-request `ref_audio` (a URL, data URL, or base64 audio) and optional `prompt_text`. Choose either reference audio or IP controls. Omitting the controls retains the configured reference fallback; `voice_name: null` does not disable it.
+- `normalize_text` controls linguistic text normalization. `scrub_markup` independently removes HTML, code fences and math markup before synthesis and defaults to `true`. Set both fields to `false` to disable markup scrubbing and linguistic normalization. Streaming segmentation and language-prefix handling still apply. Keep these controls fixed for the duration of a streaming request.
 - The talker emits mono 44.1 kHz audio.
 - Use Chat Completions for transcription; the `/v1/audio/transcriptions` endpoint is not currently available with `--omni`.
 - The model handles audio chunking internally, so the deployment configuration does not set `max_audio_clip_s` or `min_energy_split_window_size`.
 - Although the checkpoint advertises 131072 text positions, the provided deployment profiles cap the thinker `max_model_len` at 8192.
+
+## Standalone text to speech
+
+Converted Ming3 exports contain a `talker/` directory with the Talker config,
+LLM tokenizer, AudioVAE and speaker extractor. Serve that export with the
+Ming3-specific profile. The resolver accepts a local export or a Hub repository
+with that layout; `--revision` selects the Hub snapshot. Download remote storage
+exports into a local directory before serving.
+
+```bash
+vllm serve /path/to/converted-Ming3-export --omni \
+    --deploy-config vllm_omni/deploy/ming3_audio_tts.yaml \
+    --served-model-name ming3-audio-tts \
+    --port 8091
+
+curl http://localhost:8091/v1/audio/speech \
+    -H "Content-Type: application/json" \
+    -d '{"model":"ming3-audio-tts","input":"你好，很高兴认识你。","voice":"灵小柔","response_format":"wav"}' \
+    --output speech.wav
+```
+
+For voice cloning, pass `ref_audio` instead of `voice`, with optional `ref_text`.
+`voice` is an IP caption in this Ming3 endpoint. The existing
+`ming_flash_omni_tts.yaml` profile retains Ming2's nested `talker_config` layout
+and its registered `voice` presets. Converted Ming3 deployments previously using
+that Ming2 profile must select `ming3_audio_tts.yaml`.

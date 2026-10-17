@@ -77,6 +77,7 @@ def build_ming_talker_additional_info(
         "use_zero_spk_emb",
         "use_static_cache",
         "normalize_text",
+        "scrub_markup",
         "tn_mode",
         "duration_limit",
         "stream_decode",

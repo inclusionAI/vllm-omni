@@ -29,9 +29,13 @@ class GenerationParams:
     duration_limit: bool
     trim_trailing_silence: bool
     seed: int | None
+    scrub_markup: bool = False
 
 
 def resolve_generation_params(info: dict[str, Any], config: Any) -> GenerationParams:
+    scrub_markup = info.get("scrub_markup", config.scrub_markup)
+    if not isinstance(scrub_markup, bool):
+        raise ValueError("scrub_markup must be a boolean")
     instruction = create_instruction(info.get("instruction"))
     if instruction is not None:
         instruction = instruction.strip() or None
@@ -60,6 +64,7 @@ def resolve_generation_params(info: dict[str, Any], config: Any) -> GenerationPa
         duration_limit=bool(info.get("duration_limit", config.duration_limit)),
         trim_trailing_silence=bool(trim_silence),
         seed=int(info["seed"]) if info.get("seed") is not None else None,
+        scrub_markup=scrub_markup,
     )
     if params.max_steps <= 0 or params.min_steps < 0 or params.max_text_length <= 0:
         raise ValueError("max_decode_steps/max_text_length must be positive and min_decode_steps nonnegative")
@@ -73,7 +78,7 @@ def resolve_generation_params(info: dict[str, Any], config: Any) -> GenerationPa
 
 
 def resolve_conditioning_modes(info: dict[str, Any], *, has_reference: bool) -> tuple[str, str]:
-    """Mirror AntOC's auto/prompt/zero/off/mute/instruct semantics."""
+    """Resolve Ming speaker and reference-audio conditioning modes."""
     mode = str(info.get("speaker_conditioning") or "auto").strip().lower()
     audio_mode = str(info.get("prompt_audio_mode") or "continuation").strip().lower()
     if mode not in {"auto", "prompt", "zero", "off", "mute", "instruct"}:

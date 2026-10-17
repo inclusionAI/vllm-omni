@@ -23,8 +23,9 @@ from __future__ import annotations
 
 import copy
 import json
-import re
 from typing import Any
+
+import regex as re
 
 # ============================================================
 # Image-gen query-token block (thinker stage)
@@ -136,7 +137,7 @@ def create_instruction(user_input: Any) -> str | None:
         return user_input
     if not isinstance(user_input, dict):
         raise ValueError(f"Ming instruction must be str, dict, or None; got {type(user_input).__name__}")
-    # AntOC passes complete caption objects. Do not replace their controls
+    # Ming accepts complete caption objects. Do not replace their controls
     # with the all-null template by treating audio_sequence as an unknown key.
     if "audio_sequence" in user_input:
         sequence = user_input["audio_sequence"]
