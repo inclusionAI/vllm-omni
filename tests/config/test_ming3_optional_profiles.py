@@ -62,8 +62,10 @@ def test_flash_128k_overlay_preserves_base_execution_settings(variant):
     assert extended == base
 
 
-def test_ming3_history_cache_profile_reaches_legacy_and_structured_builders():
-    deploy = load_deploy_config(_DEPLOY / "ming3_audio_flash_history_cache.yaml")
+@pytest.mark.parametrize("graph", [False, True])
+def test_ming3_history_cache_profile_reaches_legacy_and_structured_builders(graph):
+    profile = "ming3_audio_flash_multiturn_graph.yaml" if graph else "ming3_audio_flash_history_cache.yaml"
+    deploy = load_deploy_config(_DEPLOY / profile)
     pipeline = resolve_pipeline_config(deploy.pipeline)
     assert pipeline is not None
     legacy = merge_pipeline_deploy(pipeline, deploy)
@@ -78,3 +80,15 @@ def test_ming3_history_cache_profile_reaches_legacy_and_structured_builders():
     assert legacy[0].yaml_engine_args["mamba_cache_mode"] == "align"
     assert legacy[0].yaml_engine_args["limit_mm_per_prompt"] == {"audio": 16}
     assert legacy[1].yaml_engine_args["enable_prefix_caching"] is False
+    if graph:
+        assert thinker.scheduler_config.max_model_len == legacy[0].yaml_engine_args["max_model_len"] == 131072
+        assert thinker.scheduler_config.max_num_batched_tokens == 32768
+        assert thinker.model_config.default_sampling_params["max_tokens"] == 65536
+        assert thinker.parallel_config.tensor_parallel_size == 4
+        assert talker.runtime_config.devices == "3"
+        overrides = talker.model_config.hf_overrides
+        assert overrides["enable_llm_cuda_graph"] is True
+        assert overrides["low_latency_streaming"] is False
+        assert overrides["normalize_text"] is True
+        assert overrides["tn_mode"] == "upstream"
+        assert legacy[1].yaml_engine_args["hf_overrides"] == overrides

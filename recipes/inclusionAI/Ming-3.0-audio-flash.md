@@ -147,18 +147,20 @@ single-token Qwen2 decode. Prefill remains eager; the outer Talker stage keeps
 The decode graph is disabled by default and when `enforce_eager` is selected.
 Unsupported inputs or capture failures fall back to eager execution.
 
-To combine Thinker prefix reuse with Talker decode graphs, save this overlay
-beside the packaged profiles, or use an absolute path to the base profile:
+To combine 128K context, up to 16 original audio clips, native Thinker KV/KDA
+prefix reuse and Talker decode graphs, select the packaged profile:
 
-```yaml
-base_config: ming3_audio_flash_history_cache.yaml
-stages:
-  - stage_id: 1
-    engine_extras:
-      hf_overrides:
-        enable_llm_cuda_graph: true
-        low_latency_streaming: false
+```bash
+vllm serve inclusionAI/Ming-3.0-audio-flash --omni \
+    --deploy-config ming3_audio_flash_multiturn_graph.yaml \
+    --served-model-name ming3-audio-flash --port 8091 \
+    --enable-prompt-tokens-details
 ```
+
+This profile explicitly sets the context limit to 131072 and the prefill batch
+limit to 32768. It keeps `low_latency_streaming: false` and the outer Talker
+`cudagraph_mode: NONE`. All audio and text share the context limit. Select the
+history-cache profile instead when Talker decode graphs are not required.
 
 Cache checkpoints and graph buffers consume GPU memory; choose cache capacity
 and context limits for the available devices. CUDA Graphs reset the Talker's
