@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 from typing import TYPE_CHECKING, Any
 
 import regex as re
@@ -17,8 +18,10 @@ from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
 from vllm_omni.model_executor.models.lingv3_tts.constants import (
     AUDIO_END_TOKEN_ID,
+    KEY_CFG,
     KEY_MAX_DECODE_STEPS,
     KEY_REQUEST_ID,
+    KEY_TEMPERATURE,
     MAX_DECODE_STEPS,
 )
 from vllm_omni.model_executor.models.lingv3_tts.prompt_assembly import (
@@ -106,6 +109,12 @@ class LingV3TTSAdapter(ARTTSAdapter):
             self._instruction(request.instructions)
         except ValueError as error:
             return str(error)
+        for key in (KEY_CFG, "temperature"):
+            value = (request.extra_params or {}).get(key)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0
+            ):
+                return f"LingV3-TTS {key} must be a finite non-negative number"
         if request.speaker_embedding is not None:
             return "LingV3-TTS v1 derives speaker conditioning from 'ref_audio'"
         if request.max_new_tokens is not None:
@@ -248,6 +257,12 @@ class LingV3TTSAdapter(ARTTSAdapter):
             info = prompt.get("additional_information")
             if isinstance(info, dict):
                 latent_cap = int(info.get(KEY_MAX_DECODE_STEPS, latent_cap))
+                cfg = (request.extra_params or {}).get(KEY_CFG)
+                if cfg is not None:
+                    info[KEY_CFG] = float(cfg)
+                temperature = (request.extra_params or {}).get("temperature")
+                if temperature is not None:
+                    info[KEY_TEMPERATURE] = float(temperature)
                 if request_id is not None:
                     info[KEY_REQUEST_ID] = request_id
                 if request.seed is not None:

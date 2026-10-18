@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 AUDIO_PATCH_TOKEN_ID = 157164
 AUDIO_START_TOKEN_ID = 157165
@@ -16,7 +16,8 @@ SAMPLE_RATE = 44100
 AUDIO_FRAME_HOP = 882
 VAE_PATCH_SIZE = 4
 
-DEFAULT_CFG = 2.0
+# Ming's cond + cfg * (cond - uncond) uses cfg=1 for antoc's uncond + 2 * (cond - uncond).
+DEFAULT_CFG = 1.0
 DEFAULT_SIGMA = 0.25
 DEFAULT_TEMPERATURE = 0.0
 MIN_DECODE_STEPS = 5

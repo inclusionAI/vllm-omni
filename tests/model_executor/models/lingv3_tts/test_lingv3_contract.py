@@ -132,7 +132,7 @@ def test_config_normalizes_bailing_and_keeps_independent_geometry():
     assert config.llm_config.kv_lora_rank + config.llm_config.qk_rope_head_dim == 576
     assert runtime.patch_size == runtime.history_patch_size == 1
     assert runtime.vae_patch_size == 4
-    assert runtime.cfg == 2.0
+    assert runtime.cfg == 1.0
     assert runtime.temperature == 0.0
     assert runtime.max_decode_steps == 800
 
@@ -354,6 +354,7 @@ def test_lingv3_vectorizes_only_compatible_flow_requests():
         torch.arange(12, dtype=torch.float32).reshape(3, 4),
         request_infos,
         [1, 1, 1],
+        [True, True, True],
     )
 
     assert set(results) == {0, 1}
@@ -1188,3 +1189,82 @@ def test_adapter_transports_content_keys_without_caching_prompt_latents(referenc
         defaults = [SamplingParams(temperature=0.0, max_tokens=251)]
         sampling = adapter.apply_sampling_overrides(defaults, request, prepared.prompt)
         assert sampling[0].max_tokens == maximum + 1
+
+
+@pytest.mark.parametrize("cfg", [None, 1.0, 2.0])
+def test_request_cfg_and_temperature_reach_flow_runtime(cfg):
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+    from vllm_omni.model_executor.models.lingv3_tts.constants import KEY_CFG, KEY_TEMPERATURE
+
+    server = SimpleNamespace(
+        engine_client=SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(tts_config={}))),
+        _apply_uploaded_speaker=lambda request: None,
+    )
+    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    extra = {"temperature": 1.5}
+    if cfg is not None:
+        extra[KEY_CFG] = cfg
+    request = OpenAICreateSpeechRequest(input="Bonjour.", instructions="calm", seed=1234, extra_params=extra)
+    assert adapter.validate(request) is None
+    prompt: dict[str, Any] = {"additional_information": {}}
+    # serving_speech applies extra_params.temperature before adapter overrides.
+    defaults = [SamplingParams(temperature=1.5, max_tokens=251)]
+    adapter.apply_sampling_overrides(defaults, request, prompt)
+    info = prompt["additional_information"]
+    assert info[KEY_TEMPERATURE] == 1.5 and info["tts_local_seed"] == 1234
+    update: dict[str, Any] = {}
+    LingV3TTSForConditionalGeneration._copy_request_state(SimpleNamespace(), update, info)
+    assert update["ming_temperature"] == 1.5
+    if cfg is None:
+        assert KEY_CFG not in info and "ming_cfg" not in update
+    else:
+        assert info[KEY_CFG] == update["ming_cfg"] == cfg
+
+
+@pytest.mark.parametrize("key", ["lingv3_cfg", "temperature"])
+@pytest.mark.parametrize("value", [-1.0, float("nan"), float("inf"), "2", True])
+def test_request_sampling_controls_reject_invalid_runtime_values(key, value):
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+
+    server = SimpleNamespace(
+        engine_client=SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(tts_config={}))),
+        _apply_uploaded_speaker=lambda request: None,
+    )
+    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    request = OpenAICreateSpeechRequest(input="Bonjour.", instructions="calm", extra_params={key: value})
+    assert "finite non-negative" in adapter.validate(request)
+
+
+@pytest.mark.parametrize("temperature", [None, 0.0, 1.5])
+def test_flow_temperature_preserves_checkpoint_default_without_request_override(temperature: float | None):
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+    from vllm_omni.model_executor.models.lingv3_tts.constants import KEY_TEMPERATURE
+    from vllm_omni.model_executor.models.ming_tts.patch_emission import _resolve_runtime_float
+
+    server = SimpleNamespace(
+        engine_client=SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(tts_config={"sampling_temperature": 1.5}))
+        ),
+    )
+    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    extra = {} if temperature is None else {"temperature": temperature}
+    request = OpenAICreateSpeechRequest(input="你好。", extra_params=extra)
+    defaults = [SamplingParams(temperature=0.0, max_tokens=801)]
+    prompt: dict[str, Any] = {"additional_information": {}}
+    adapter.apply_sampling_overrides(defaults, request, prompt)
+    info = prompt["additional_information"]
+    if temperature is None:
+        assert KEY_TEMPERATURE not in info
+    else:
+        assert info[KEY_TEMPERATURE] == temperature
+    update: dict[str, Any] = {}
+    LingV3TTSForConditionalGeneration._copy_request_state(SimpleNamespace(), update, info)
+    effective = _resolve_runtime_float(update, "ming_temperature", adapter.tts_config["sampling_temperature"])
+    assert effective == (1.5 if temperature is None else temperature)
+    assert defaults[0].temperature == 0.0
