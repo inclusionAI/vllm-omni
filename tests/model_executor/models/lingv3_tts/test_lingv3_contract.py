@@ -199,7 +199,7 @@ def test_prefill_uses_vendor_prompt_posterior_and_continues_request_rng(monkeypa
     assert calls["generator_request"] == (info, torch.device("cpu"))
     assert calls["prompt"][2] == {
         "generator": generator,
-        "posterior_parameterization": "clamped_logvar",
+        "posterior_parameterization": "softplus_scale",
     }
 
 
@@ -415,3 +415,76 @@ def test_adapter_validates_checkpoint_conditioning_and_minimum(tts_config, ref_t
         assert result is None
     else:
         assert error in result
+
+
+@pytest.mark.parametrize("patch_size,encoder_depth", [(4, 6), (4, 24), (-1, 6)])
+def test_prompt_encoder_preserves_configured_depth_and_posterior_without_dtype_changes(patch_size, encoder_depth):
+    from vllm_omni.model_executor.models.common.ming.audio_vae import AudioVAE, AudioVAEConfig
+    from vllm_omni.model_executor.models.ming_tts.prompt_encoder import _resolve_prompt_latents
+
+    audio_vae = (
+        AudioVAE(
+            AudioVAEConfig(
+                enc_kwargs={
+                    "backbone": dict(
+                        hidden_size=16,
+                        intermediate_size=32,
+                        num_hidden_layers=encoder_depth,
+                        num_attention_heads=2,
+                        num_key_value_heads=2,
+                        vocab_size=1,
+                        _attn_implementation="sdpa",
+                        use_cache=False,
+                    ),
+                    "input_dim": 882,
+                    "hop_size": 882,
+                    "latent_dim": 2,
+                },
+                patch_size=patch_size,
+            ),
+            build_decoder=False,
+        )
+        .eval()
+        .to(dtype=torch.bfloat16)
+    )
+    encoder = audio_vae.encoder
+    assert encoder.encoder.config.num_hidden_layers == encoder_depth
+    state = {name: value.clone() for name, value in audio_vae.state_dict().items()}
+    buffers = {name: value.clone() for name, value in encoder.named_buffers()}
+    wrapper = SimpleNamespace(
+        _prompt_encoder=audio_vae,
+        ming_config=SimpleNamespace(sample_rate=44100, patch_size=1, latent_dim=2),
+    )
+    visited, outputs = [], []
+    hooks = [
+        layer.register_forward_hook(lambda module, args, output, i=i: visited.append(i))
+        for i, layer in enumerate(encoder.encoder.layers)
+    ]
+    hooks.append(encoder.register_forward_hook(lambda module, args, output: outputs.append(output[0])))
+    try:
+        with torch.inference_mode():
+            actual = _resolve_prompt_latents(
+                wrapper,
+                {"prompt_waveform": torch.zeros(1, 3528)},
+                generator=torch.Generator().manual_seed(17),
+            )
+        assert visited == list(range(encoder_depth))
+        assert len(encoder.encoder.layers) == encoder_depth
+        assert encoder.encoder.config.num_hidden_layers == encoder_depth
+        if patch_size != -1:
+            assert encoder.aggregator.config.num_hidden_layers == 4
+        mean, scale = outputs[0].transpose(1, 2).chunk(2, dim=1)
+        noise = torch.randn(mean.shape, dtype=mean.dtype, generator=torch.Generator().manual_seed(17))
+        expected = (mean + (torch.nn.functional.softplus(scale) + 1e-4) * noise).transpose(1, 2)
+        assert torch.equal(actual["frames"], expected.squeeze(0).float())
+        assert actual["frames"].shape == (1 if patch_size == 4 else 4, 2)
+        assert set(audio_vae.state_dict()) == set(state)
+        for name, value in audio_vae.state_dict().items():
+            assert value.dtype == state[name].dtype
+            assert torch.equal(value, state[name])
+        for name, value in encoder.named_buffers():
+            assert value.dtype == buffers[name].dtype
+            assert torch.equal(value, buffers[name])
+    finally:
+        for hook in hooks:
+            hook.remove()

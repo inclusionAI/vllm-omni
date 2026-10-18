@@ -169,7 +169,7 @@ class LingV3TTSForConditionalGeneration(
             self,
             info,
             generator=prompt_generator,
-            posterior_parameterization="clamped_logvar",
+            posterior_parameterization="softplus_scale",
         )
         history = _initial_history(
             prompt_latents["frames"] if prompt_latents is not None else None,
