@@ -22,6 +22,8 @@ from vllm_omni.model_executor.models.lingv3_tts.constants import (
     AUDIO_END_TOKEN_ID,
     AUDIO_PATCH_TOKEN_ID,
     AUDIO_START_TOKEN_ID,
+    KEY_MAX_DECODE_STEPS,
+    KEY_MIN_DECODE_STEPS,
     SPEAKER_END_TOKEN_ID,
     SPEAKER_START_TOKEN_ID,
 )
@@ -37,6 +39,7 @@ from vllm_omni.model_executor.models.lingv3_tts.prompt_assembly import (
     USER_PREFIX,
     build_lingv3_prompt,
     build_lingv3_prompt_token_ids,
+    resolve_podcast_decode_window,
     validate_lingv3_tokenizer,
 )
 
@@ -45,7 +48,10 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.tts]
 
 class FakeTokenizer:
     eos_token_id = 156892
+    unk_token_id = None
     special = {
+        "<|endoftext|>": 156892,
+        "<|role_end|>": 156895,
         "<audioPatch>": AUDIO_PATCH_TOKEN_ID,
         "<audio>": AUDIO_START_TOKEN_ID,
         "</audio>": AUDIO_END_TOKEN_ID,
@@ -53,14 +59,22 @@ class FakeTokenizer:
         "</spk>": SPEAKER_END_TOKEN_ID,
     }
 
+    def __init__(self):
+        self.special = dict(self.special)
+
     def convert_tokens_to_ids(self, token):
         return self.special.get(token)
 
     def encode(self, text, add_special_tokens=False):
         del add_special_tokens
-        if text in self.special:
-            return [self.special[text]]
-        return [1000 + ord(char) for char in text]
+        import regex as re
+
+        tokens = re.split("(" + "|".join(re.escape(token) for token in self.special) + ")", text)
+        return [
+            item
+            for part in tokens
+            for item in ([self.special[part]] if part in self.special else [1000 + ord(c) for c in part])
+        ]
 
 
 def _config() -> LingV3TTSConfig:
@@ -117,32 +131,26 @@ def test_config_normalizes_bailing_and_keeps_independent_geometry():
     assert config.llm_config.kv_lora_rank + config.llm_config.qk_rope_head_dim == 576
     assert runtime.patch_size == runtime.history_patch_size == 1
     assert runtime.vae_patch_size == 4
+    assert runtime.cfg == 2.0
+    assert runtime.temperature == 0.0
+    assert runtime.max_decode_steps == 800
 
 
-def test_prompt_contract_speaker_only():
+@pytest.mark.parametrize("text", ["target", "Genre: x Mood: x Instrument: x Theme: x Duration: 3s"])
+def test_prompt_contract_speaker_only(text):
     tokenizer = FakeTokenizer()
-    ids, speaker_position, prompt_position = build_lingv3_prompt_token_ids(tokenizer, target_text="target")
+    ids, speaker_position, prompt_position = build_lingv3_prompt_token_ids(tokenizer, target_text=text)
     expected = (
         tokenizer.encode(USER_PREFIX)
         + [SPEAKER_START_TOKEN_ID, AUDIO_PATCH_TOKEN_ID, SPEAKER_END_TOKEN_ID]
         + tokenizer.encode(TEXT_PREFIX)
-        + tokenizer.encode("target")
+        + tokenizer.encode(text)
         + tokenizer.encode(ASSISTANT_PREFIX)
         + [AUDIO_START_TOKEN_ID]
     )
     assert ids == expected
     assert ids[speaker_position] == AUDIO_PATCH_TOKEN_ID
     assert prompt_position is None
-
-
-def test_prompt_contract_requires_reference_audio():
-    with pytest.raises(ValueError, match="requires reference audio"):
-        build_lingv3_prompt(
-            FakeTokenizer(),
-            target_text="target",
-            reference_waveform=None,
-            reference_sample_rate=24000,
-        )
 
 
 def test_prompt_contract_concatenates_reference_and_target_without_separator():
@@ -488,3 +496,519 @@ def test_prompt_encoder_preserves_configured_depth_and_posterior_without_dtype_c
     finally:
         for hook in hooks:
             hook.remove()
+
+
+@pytest.mark.parametrize("eos_id", [156892, 156895, 123])
+def test_prompt_eos_contract(eos_id):
+    tokenizer = FakeTokenizer()
+    tokenizer.eos_token_id = eos_id
+    tokenizer.special = {**tokenizer.special, "<|role_end|>": 156895}
+    if eos_id == 123:
+        with pytest.raises(ValueError, match="EOS"):
+            build_lingv3_prompt_token_ids(tokenizer, target_text="测试")
+    else:
+        ids, _, _ = build_lingv3_prompt_token_ids(tokenizer, target_text="测试")
+        assert ids[-1] == AUDIO_START_TOKEN_ID
+        assert 156895 not in ids
+
+
+@pytest.mark.parametrize(
+    "controls", [{"语速": "快速", "基频": "中", "音量": "高"}, {"情感": "高兴"}, {"方言": "广粤话"}]
+)
+def test_control_caption_precedes_audio(controls):
+    from vllm_omni.model_executor.models.ming_tts.prompt_assembly import create_instruction
+
+    tokenizer = FakeTokenizer()
+    tokenizer.special["<|endoftext|>"] = 156892
+    caption = create_instruction(controls)
+    actual, speaker_position, _ = build_lingv3_prompt_token_ids(tokenizer, target_text="测试文本", instruction=caption)
+    base, _, _ = build_lingv3_prompt_token_ids(tokenizer, target_text="测试文本")
+    expected = base[:-1] + tokenizer.encode(caption) + [156892, AUDIO_START_TOKEN_ID]
+    assert actual == expected
+    assert actual[speaker_position] == AUDIO_PATCH_TOKEN_ID
+    assert actual[-2:] == [156892, AUDIO_START_TOKEN_ID]
+
+
+@pytest.mark.parametrize("eos_id", [156892, 156895])
+@pytest.mark.parametrize("prompt_steps", [0, 2])
+@pytest.mark.parametrize("speaker_count", [0, 1])
+def test_control_caption_uses_checkpoint_eos(eos_id, prompt_steps, speaker_count):
+    from vllm_omni.model_executor.models.ming_tts.prompt_assembly import create_instruction
+
+    tokenizer = FakeTokenizer()
+    tokenizer.eos_token_id = eos_id
+    tokenizer.special.update({"<|endoftext|>": 156892, "<|role_end|>": 156895})
+    caption = create_instruction({"风格": "温柔<|endoftext|>舒缓"})
+    kwargs = dict(
+        target_text="测试文本",
+        prompt_text="参考文本" if prompt_steps else None,
+        prompt_latent_steps=prompt_steps,
+        speaker_count=speaker_count,
+    )
+    base, _, _ = build_lingv3_prompt_token_ids(tokenizer, **kwargs)
+    actual, _, _ = build_lingv3_prompt_token_ids(tokenizer, instruction=caption, **kwargs)
+    audio_start = len(base) - prompt_steps - 1
+    expected = base[:audio_start] + tokenizer.encode(caption) + [eos_id] + base[audio_start:]
+    assert actual == expected
+    assert actual[-prompt_steps - 2] == eos_id
+
+
+def test_prompt_contract_requires_instruction_without_reference_audio():
+    with pytest.raises(ValueError, match="requires an instruction"):
+        build_lingv3_prompt(
+            FakeTokenizer(),
+            target_text="target",
+            reference_waveform=None,
+            reference_sample_rate=24000,
+        )
+
+
+@pytest.mark.parametrize(
+    "minimum,maximum,emitted,probability,reason",
+    [
+        (8, 16, 7, 1.0, STOP_REASON_CONTINUE),
+        (8, 16, 8, 1.0, STOP_REASON_STOP_HEAD),
+        (8, 16, 16, 0.0, STOP_REASON_MAX_DECODE_STEPS),
+        (20, 32, 13, 1.0, STOP_REASON_CONTINUE),
+        (None, 32, 12, 1.0, STOP_REASON_CONTINUE),
+        (None, 32, 13, 1.0, STOP_REASON_STOP_HEAD),
+    ],
+)
+def test_request_decode_window_overrides_checkpoint_minimum(minimum, maximum, emitted, probability, reason):
+    from vllm_omni.model_executor.models.ming_tts import config_ming_tts as state_keys
+
+    model = SimpleNamespace(ming_config=SimpleNamespace(stop_head_min_steps=13, max_decode_steps=250))
+    info = {state_keys.KEY_MAX_DECODE_STEPS: maximum}
+    if minimum is not None:
+        info[state_keys.KEY_MIN_DECODE_STEPS] = minimum
+    LingV3TTSLLMModel._validate_decode_window(model, [info])
+    result = LingV3TTSLLMModel._resolve_stop_decision(
+        model,
+        step=emitted - 1,
+        stop_prob=probability,
+        stop_threshold=0.5,
+        min_stop_step=13,
+        min_decode_steps=info[state_keys.KEY_MIN_DECODE_STEPS],
+        max_decode_steps=maximum,
+        audio_dummy_token_id=AUDIO_PATCH_TOKEN_ID,
+        text_eos_token_id=AUDIO_END_TOKEN_ID,
+    )
+    assert result[0] == reason
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("speaker_1:你好。\nspeaker_2:再见。", (8, 24)),
+        ("speaker_1:Hello there.\nspeaker_2:How are you today?", (8, 48)),
+        ("speaker_1:你好。\nspeaker_2:Hello there.", (8, 28)),
+        ("\n speaker_1:a\n speaker_2:b\n", (8, 16)),
+        ("speaker_1:" + "你" * 700 + "\nspeaker_2:好", (600, 600)),
+    ],
+)
+def test_podcast_decode_window_matches_text_units(text, expected):
+    assert resolve_podcast_decode_window(text) == expected
+
+
+def test_podcast_explicit_limit_only_tightens_the_window():
+    text = "speaker_1:你好。\nspeaker_2:再见。"
+    assert resolve_podcast_decode_window(text, max_decode_steps=16) == (8, 16)
+    assert resolve_podcast_decode_window(text, max_decode_steps=800) == (8, 24)
+    with pytest.raises(ValueError, match="text-derived minimum 8"):
+        resolve_podcast_decode_window(text, max_decode_steps=7)
+
+
+def test_podcast_prompt_keeps_speaker_order_and_audio_boundaries():
+    from vllm_omni.model_executor.models.lingv3_tts.constants import (
+        KEY_SPEAKER_SAMPLE_RATES,
+        KEY_SPEAKER_WAVEFORM,
+        KEY_SPEAKER_WAVEFORM_LENGTHS,
+    )
+    from vllm_omni.model_executor.models.ming_tts.audio_prep import _find_speaker_placeholder_positions
+
+    tokenizer = FakeTokenizer()
+    prompt = build_lingv3_prompt(
+        tokenizer,
+        target_text=" speaker_1:你好。\n speaker_2:再见。\n",
+        reference_waveform=[torch.ones(1, 3), torch.full((1, 5), 2.0)],
+        reference_sample_rate=[16000, 24000],
+        prompt_text=" speaker_1:参考一。\n speaker_2:参考二。\n",
+    )
+    ids = prompt["prompt_token_ids"]
+    slots = _find_speaker_placeholder_positions(torch.tensor(ids), LingV3TTSRuntimeConfig.from_hf_config(_config()))
+    assert len(slots) == 2
+    assert ids[slots[0] + 2 : slots[1] - 1] == tokenizer.encode("\n  speaker_2:")
+    assert ids[-1] == AUDIO_PATCH_TOKEN_ID
+    info = prompt["additional_information"]
+    assert (info[KEY_MIN_DECODE_STEPS], info[KEY_MAX_DECODE_STEPS]) == (8, 24)
+    assert info[KEY_SPEAKER_WAVEFORM_LENGTHS].tolist() == [3, 5]
+    assert info[KEY_SPEAKER_SAMPLE_RATES].tolist() == [16000, 24000]
+    assert info[KEY_SPEAKER_WAVEFORM].tolist() == [[1.0] * 3 + [2.0] * 5]
+    assert info["prompt_waveform"].shape == (1, 3528)
+
+
+def test_podcast_extractor_splits_clips_before_resampling():
+    from vllm_omni.model_executor.models.lingv3_tts.speaker_extractor import resolve_speaker_embeddings
+
+    calls = []
+
+    def extract(waveform, sample_rate):
+        calls.append((waveform.tolist(), sample_rate))
+        return torch.full((192,), float(len(calls)))
+
+    wrapper = SimpleNamespace(
+        _speaker_extractor=SimpleNamespace(extract_from_waveform=extract),
+        ming_config=SimpleNamespace(sample_rate=44100),
+    )
+    info = build_lingv3_prompt(
+        FakeTokenizer(),
+        target_text="speaker_1:你好。\nspeaker_2:再见。",
+        reference_waveform=[torch.ones(1, 3), torch.full((1, 5), 2.0)],
+        reference_sample_rate=[16000, 24000],
+        prompt_text=" speaker_1:参考一。\n speaker_2:参考二。\n",
+    )["additional_information"]
+    speakers = resolve_speaker_embeddings(wrapper, info)
+    assert calls == [([[1.0] * 3], 16000), ([[2.0] * 5], 24000)]
+    assert len(speakers) == 2
+    assert torch.equal(speakers[0], torch.ones(192))
+    assert torch.equal(speakers[1], torch.full((192,), 2.0))
+
+
+@pytest.mark.parametrize(
+    "text,max_tokens,error",
+    [
+        ("speaker_1:你好。\nspeaker_2:再见。", None, None),
+        ("speaker_1:你好。\nspeaker_2:再见。", 8, None),
+        ("speaker_1:你好。\nspeaker_2:再见。", 7, "text-derived minimum 8"),
+        ("speaker_1:你好。\nspeaker_3:再见。", None, "each supplied"),
+        ("普通文本", None, "one 'speaker_N: text'"),
+    ],
+)
+def test_podcast_adapter_validates_turns(text, max_tokens, error):
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+
+    server = SimpleNamespace(
+        engine_client=SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    tts_config={
+                        "conditioning_mode": "speaker_only",
+                        "task_decode_alignment": {"podcast": "old_shift"},
+                        "minimum_decode_steps": 13,
+                    }
+                )
+            )
+        ),
+        _apply_uploaded_speaker=lambda request: None,
+        _validate_ref_audio_format=lambda source: None,
+    )
+    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    request = OpenAICreateSpeechRequest(
+        input=text,
+        ref_audio=["data:audio/wav;base64,AA=="] * 2,
+        ref_text=" speaker_1:参考一。\n speaker_2:参考二。\n",
+        max_new_tokens=max_tokens,
+    )
+    result = adapter.validate(request)
+    assert result is None if error is None else error in result
+
+
+@pytest.mark.parametrize("speaker_count", [1, 2])
+@pytest.mark.parametrize(
+    "language,expected",
+    [
+        ("ja", "Japanese"),
+        (" Japanese ", "Japanese"),
+        ("de", "German"),
+        ("fr", "French"),
+        ("ko", "Korean"),
+        ("es", "Spanish"),
+        ("ZH_CN", "Chinese"),
+        ("en", "English"),
+        ("unknown", None),
+        (" ", None),
+    ],
+)
+def test_adapter_language_and_reference_continuation(speaker_count, language, expected):
+    import asyncio
+
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+
+    async def resolve(source):
+        return [0.25] * 3528, 44100, source
+
+    tokenizer = FakeTokenizer()
+    server = SimpleNamespace(
+        engine_client=SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    tts_config={
+                        "conditioning_mode": "speaker_only",
+                        "task_decode_alignment": {"podcast": "old_shift"},
+                    }
+                )
+            )
+        ),
+        _tts_tokenizer=tokenizer,
+        _resolve_ref_audio=resolve,
+        _get_resolved_ref_audio_artifact_key=lambda key: key,
+        _apply_uploaded_speaker=lambda request: None,
+        _validate_ref_audio_format=lambda source: None,
+    )
+    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    text = "こんにちは。" if speaker_count == 1 else "speaker_1:こんにちは。\nspeaker_2:はい。"
+    transcript = "参考。" if speaker_count == 1 else "speaker_1:参考一。\nspeaker_2:参考二。"
+    request = OpenAICreateSpeechRequest(
+        input=text,
+        ref_audio="reference" if speaker_count == 1 else ["reference", "other"],
+        ref_text=transcript,
+        language=language,
+    )
+    if expected is None:
+        assert "target language" in adapter.validate(request)
+        return
+    assert adapter.validate(request) is None
+    prepared = asyncio.run(adapter.build(request, [], True))
+    expected_prefix = "<role>HUMAN</role>Please generate speech based on the following description.\n"
+    expected_prefix += f"Target language: {expected}.\n  speaker_1:"
+    ids = prepared.prompt["prompt_token_ids"]
+    prefix_ids = tokenizer.encode(expected_prefix)
+    assert ids[: len(prefix_ids)] == prefix_ids
+    reference_start = len(ids) - speaker_count - 1
+    assert ids[reference_start:] == [AUDIO_START_TOKEN_ID] + [AUDIO_PATCH_TOKEN_ID] * speaker_count
+    assert (
+        tokenizer.encode(transcript + text + ASSISTANT_PREFIX)
+        == ids[reference_start - len(tokenizer.encode(transcript + text + ASSISTANT_PREFIX)) : reference_start]
+    )
+    assert prepared.tts_params["prompt_waveform"].shape[-1] == 3528 * speaker_count
+    assert "prompt_latents" not in prepared.tts_params
+
+
+@pytest.mark.parametrize("speaker_count", [1, 2])
+@pytest.mark.parametrize("enabled,infer", [(False, False), (True, False), (True, True)])
+def test_adapter_missing_language_preserves_defaults(speaker_count, enabled, infer):
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+
+    server = SimpleNamespace(
+        engine_client=SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    tts_config={"enable_tts_target_language": enabled, "infer_tts_language_from_text": infer}
+                )
+            )
+        )
+    )
+    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    request = OpenAICreateSpeechRequest(input="你好。", ref_audio=["reference"] * speaker_count)
+    if speaker_count > 1 and enabled and not infer:
+        with pytest.raises(ValueError, match="explicit language"):
+            adapter._target_language(request)
+    else:
+        assert adapter._target_language(request) == ("Chinese" if speaker_count > 1 and enabled else None)
+
+
+@pytest.mark.parametrize("instruction", ["温柔、舒缓", "Speaking instruction: Speak in this style: 温柔、舒缓"])
+def test_freeform_instruction_precedes_audio(instruction):
+    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+
+    tokenizer = FakeTokenizer()
+    tokenizer.special["<|endoftext|>"] = 156892
+    caption = LingV3TTSAdapter._instruction(instruction)
+    assert caption == "Speaking instruction: Speak in this style: 温柔、舒缓"
+    ids, _, _ = build_lingv3_prompt_token_ids(tokenizer, target_text="你好。", instruction=caption)
+    expected = tokenizer.encode(ASSISTANT_PREFIX + caption) + [156892, AUDIO_START_TOKEN_ID]
+    assert ids[-len(expected) :] == expected
+
+
+def test_no_speaker_slot_prompt_and_prefill(monkeypatch):
+    import vllm_omni.model_executor.models.lingv3_tts.lingv3_tts as model_module
+
+    tokenizer = FakeTokenizer()
+    prompt = build_lingv3_prompt(
+        tokenizer,
+        target_text="清晨的风穿过树林。",
+        reference_waveform=None,
+        reference_sample_rate=None,
+        speaker_slot=False,
+    )
+    ids = torch.tensor(prompt["prompt_token_ids"])
+    expected = tokenizer.encode(
+        "<role>HUMAN</role>Please generate speech based on the following description.\n"
+        " Text input:\n清晨的风穿过树林。<role>ASSISTANT</role><audio>"
+    )
+    assert ids.tolist() == expected
+    info = prompt["additional_information"]
+    assert set(info) == {KEY_MAX_DECODE_STEPS, "no_speaker_slot"}
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("No speaker or prompt audio extraction expected")
+
+    monkeypatch.setattr(model_module, "resolve_speaker_embeddings", forbidden)
+    monkeypatch.setattr(model_module, "_resolve_prompt_latents", forbidden)
+    wrapper = SimpleNamespace(
+        ming_config=SimpleNamespace(
+            history_patch_size=1, latent_dim=64, speaker_placeholder_token_id=SPEAKER_START_TOKEN_ID
+        ),
+        _copy_request_state=lambda update, info: None,
+    )
+    embeds = torch.ones((len(ids), 4))
+    _, result, _ = LingV3TTSForConditionalGeneration._prefill_preprocess(wrapper, ids, embeds, info)
+    assert torch.all(result == 1)
+
+
+def test_no_speaker_slot_keeps_text_prefix_after_user_prompt():
+    tokenizer = FakeTokenizer()
+    text = "Genre: jazz Mood: calm Instrument: piano Theme: dawn Duration: short"
+    ids, _, _ = build_lingv3_prompt_token_ids(tokenizer, target_text=text, speaker_count=0)
+    expected = tokenizer.encode(
+        "<role>HUMAN</role>Please generate speech based on the following description.\n"
+        f" Text input:\n{text}<role>ASSISTANT</role><audio>"
+    )
+    assert ids == expected
+
+
+@pytest.mark.parametrize("instruction", [" ", '{"语速":', "[]", "{}", '{"语速": 3}', '{"未知": "中"}'])
+def test_invalid_structured_instructions_are_not_freeform(instruction):
+    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+
+    with pytest.raises(ValueError):
+        LingV3TTSAdapter._instruction(instruction)
+
+
+def test_full_structured_instruction_preserves_archived_token_order():
+    import json
+
+    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+    from vllm_omni.model_executor.models.ming_tts.prompt_assembly import create_instruction
+
+    caption = {
+        "audio_sequence": [
+            {
+                "序号": 1,
+                "说话人": "speaker_1",
+                "方言": "川渝话",
+                "情感": None,
+                "风格": None,
+                "语速": None,
+                "基频": None,
+                "音量": None,
+                "BGM": dict.fromkeys(["Genre", "Mood", "Instrument", "Theme", "ENV", "SNR"]),
+                "IP": None,
+            }
+        ]
+    }
+    raw = json.dumps(caption, ensure_ascii=False)
+    normalized = create_instruction({"方言": "川渝话"})
+    assert json.loads(normalized) == caption and normalized != raw
+    instruction = LingV3TTSAdapter._instruction(raw)
+    assert instruction == raw
+    tokenizer = FakeTokenizer()
+    actual, _, _ = build_lingv3_prompt_token_ids(tokenizer, target_text="你好。", instruction=instruction)
+    caption_tokens = tokenizer.encode(raw)
+    assert actual[-len(caption_tokens) - 2 :] == caption_tokens + [tokenizer.eos_token_id, AUDIO_START_TOKEN_ID]
+    invalid_cases: tuple[dict[str, Any], ...] = ({"audio_sequence": []}, {"audio_sequence": [{"方言": "川渝话"}]})
+    for invalid in invalid_cases:
+        with pytest.raises(ValueError):
+            LingV3TTSAdapter._instruction(json.dumps(invalid, ensure_ascii=False))
+
+
+@pytest.mark.parametrize("controls", [{"情感": "高兴"}, {"风格": "沉稳的男性旁白"}, {"IP": "阿狸"}])
+def test_no_reference_controls_mask_only_speaker_slot(monkeypatch, controls):
+    import asyncio
+    import json
+
+    from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+    from vllm_omni.model_executor.models.lingv3_tts import lingv3_tts as model_module
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Masked conditioning must not resolve audio, extract or project speakers, or encode reference VAE")
+
+    tokenizer = FakeTokenizer()
+    tokenizer.special["<|endoftext|>"] = 156892
+    server = SimpleNamespace(
+        engine_client=SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(tts_config={}))),
+        _tts_tokenizer=tokenizer,
+        _resolve_ref_audio=forbidden,
+        _apply_uploaded_speaker=lambda request: None,
+        _validate_ref_audio_format=forbidden,
+    )
+    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    request = OpenAICreateSpeechRequest(input="你好。", instructions=json.dumps(controls, ensure_ascii=False))
+    assert adapter.validate(request) is None
+    prepared = asyncio.run(adapter.build(request, [], False))
+    info = deserialize_additional_information(serialize_additional_information(prepared.tts_params))
+    assert set(info) == {KEY_MAX_DECODE_STEPS, "mute_speaker"}
+    ids = torch.tensor(prepared.prompt["prompt_token_ids"])
+    assert (ids == SPEAKER_START_TOKEN_ID).sum().item() == 1
+    slot = (ids == SPEAKER_START_TOKEN_ID).nonzero().item() + 1
+    assert ids[-1].item() == AUDIO_START_TOKEN_ID
+    embeds = torch.ones((len(ids), 4))
+    monkeypatch.setattr(model_module, "resolve_speaker_embeddings", forbidden)
+    monkeypatch.setattr(model_module, "_resolve_prompt_latents", forbidden)
+    wrapper = SimpleNamespace(
+        model=SimpleNamespace(project_speaker_embedding=forbidden),
+        ming_config=SimpleNamespace(
+            history_patch_size=1, latent_dim=64, speaker_placeholder_token_id=SPEAKER_START_TOKEN_ID
+        ),
+        _copy_request_state=lambda update, info: None,
+    )
+    _, result, _ = LingV3TTSForConditionalGeneration._prefill_preprocess(wrapper, ids, embeds, info)
+    assert torch.count_nonzero(result[slot]).item() == 0
+    assert torch.all(result[:slot] == 1) and torch.all(result[slot + 1 :] == 1)
+
+
+@pytest.mark.parametrize(
+    "fields,error",
+    [
+        ({"ref_text": "参考"}, "requires reference audio"),
+        ({"instructions": ""}, "reference audio or"),
+        ({"task_type": "Base"}, "reference audio or"),
+    ],
+)
+def test_no_reference_request_rejects_invalid_conditioning(fields, error):
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+
+    adapter = LingV3TTSAdapter(
+        SpeechServingContext(server=SimpleNamespace(_apply_uploaded_speaker=lambda request: None))
+    )
+    assert error in adapter.validate(OpenAICreateSpeechRequest(input="你好。", **fields))
+
+
+def test_online_emergent_omits_speaker_conditioning():
+    import asyncio
+
+    from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Emergent must not resolve or validate reference audio")
+
+    server = SimpleNamespace(
+        engine_client=SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(tts_config={}))),
+        _tts_tokenizer=FakeTokenizer(),
+        _apply_uploaded_speaker=lambda request: None,
+        _resolve_ref_audio=forbidden,
+        _validate_ref_audio_format=forbidden,
+    )
+    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    request = OpenAICreateSpeechRequest(input="清晨的风穿过树林。")
+    assert adapter.validate(request) is None
+    prepared = asyncio.run(adapter.build(request, [], False))
+    ids = prepared.prompt["prompt_token_ids"]
+    assert SPEAKER_START_TOKEN_ID not in ids
+    assert ids[-1] == AUDIO_START_TOKEN_ID
+    info = deserialize_additional_information(serialize_additional_information(prepared.tts_params))
+    assert set(info) == {KEY_MAX_DECODE_STEPS, "no_speaker_slot"}

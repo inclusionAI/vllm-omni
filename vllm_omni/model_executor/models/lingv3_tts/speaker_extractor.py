@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -40,20 +40,26 @@ def resolve_speaker_embeddings(wrapper: Any, info: dict[str, Any]) -> list[torch
     waveform = coerce_prompt_waveform(waveform)
     lengths = torch.as_tensor(info.get(KEY_SPEAKER_WAVEFORM_LENGTHS, [waveform.shape[-1]])).reshape(-1)
     sample_rates = torch.as_tensor(info.get(KEY_SPEAKER_SAMPLE_RATES, [wrapper.ming_config.sample_rate])).reshape(-1)
-    if lengths.numel() != 1 or sample_rates.numel() != 1:
-        raise ValueError("LingV3-TTS v1 accepts exactly one reference audio clip")
-
-    extractor = getattr(wrapper, "_speaker_extractor", None)
-    if extractor is None:
-        with _LOAD_LOCK:
-            extractor = getattr(wrapper, "_speaker_extractor", None)
-            if extractor is None:
-                extractor = SpeakerEmbeddingExtractor(wrapper.vllm_config.model_config.model, target_sr=16000)
-                wrapper._speaker_extractor = extractor
-    embedding = extractor.extract_from_waveform(waveform[:, : int(lengths[0])], int(sample_rates[0]))
-    embeddings = coerce_speaker_embeddings(embedding)
-    if not embeddings:
-        raise RuntimeError("CAM++ returned no LingV3 speaker embedding")
+    if lengths.numel() == 0 or lengths.numel() != sample_rates.numel():
+        raise ValueError("Each LingV3 reference audio clip requires a length and sample rate")
+    if (lengths <= 0).any() or (sample_rates <= 0).any() or int(lengths.sum()) != waveform.shape[-1]:
+        raise ValueError("Invalid LingV3 reference audio lengths or sample rates")
+    embeddings = []
+    offset = 0
+    for length, sample_rate in zip(lengths.tolist(), sample_rates.tolist(), strict=True):
+        extractor = getattr(wrapper, "_speaker_extractor", None)
+        if extractor is None:
+            with _LOAD_LOCK:
+                extractor = getattr(wrapper, "_speaker_extractor", None)
+                if extractor is None:
+                    extractor = SpeakerEmbeddingExtractor(wrapper.vllm_config.model_config.model, target_sr=16000)
+                    wrapper._speaker_extractor = extractor
+        embedding = extractor.extract_from_waveform(waveform[:, offset : offset + length], sample_rate)
+        extracted = coerce_speaker_embeddings(embedding)
+        if len(extracted) != 1:
+            raise RuntimeError("CAM++ must return one LingV3 speaker embedding per reference clip")
+        embeddings.extend(extracted)
+        offset += length
     return embeddings
 
 

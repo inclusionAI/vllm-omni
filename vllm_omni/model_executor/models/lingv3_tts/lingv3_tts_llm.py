@@ -125,10 +125,9 @@ class LingV3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
     def _validate_decode_window(self, request_infos: list[dict[str, Any]]) -> None:
         for index, info in enumerate(request_infos):
             maximum = _resolve_runtime_int(info, KEY_MAX_DECODE_STEPS, self.ming_config.max_decode_steps)
-            minimum = max(
-                self.ming_config.stop_head_min_steps,
-                _resolve_optional_runtime_int(info, KEY_MIN_DECODE_STEPS, 0),
-            )
+            # The shared Ming loop reads this field with a zero default; resolve LingV3's fallback here.
+            info.setdefault(KEY_MIN_DECODE_STEPS, self.ming_config.stop_head_min_steps)
+            minimum = max(1, _resolve_optional_runtime_int(info, KEY_MIN_DECODE_STEPS, 0))
             if maximum < minimum:
                 raise ValueError(
                     f"LingV3 request idx={index}: maximum decode steps {maximum} is smaller than minimum {minimum}"
@@ -150,7 +149,7 @@ class LingV3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
             emitted_steps=step + 1,
             stop_probability=stop_prob,
             stop_threshold=stop_threshold,
-            minimum_steps=max(min_stop_step, min_decode_steps),
+            minimum_steps=max(1, min_decode_steps),
             maximum_steps=max_decode_steps,
             continue_token_id=audio_dummy_token_id,
             stop_token_id=text_eos_token_id,

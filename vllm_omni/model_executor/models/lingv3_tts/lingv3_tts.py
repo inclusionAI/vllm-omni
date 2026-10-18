@@ -27,9 +27,7 @@ from vllm_omni.model_executor.models.ming_tts.audio_prep import (
 from vllm_omni.model_executor.models.ming_tts.ming_tts import (
     _ModelSampleAdapter,
 )
-from vllm_omni.model_executor.models.ming_tts.prompt_encoder import (
-    _resolve_prompt_latents,
-)
+from vllm_omni.model_executor.models.ming_tts.prompt_encoder import _resolve_prompt_latents
 
 from .config_lingv3_tts import LingV3TTSRuntimeConfig, get_lingv3_backbone_config
 from .constants import (
@@ -39,6 +37,8 @@ from .constants import (
     KEY_MIN_DECODE_STEPS,
     KEY_REQUEST_ID,
     KEY_SIGMA,
+    KEY_SPEAKER_EMBEDDING,
+    KEY_SPEAKER_WAVEFORM,
     KEY_STOP_REASON,
     KEY_TEMPERATURE,
 )
@@ -162,14 +162,23 @@ class LingV3TTSForConditionalGeneration(
         input_embeds: torch.Tensor,
         info: dict[str, Any],
     ):
+        mute_speaker = bool(_take_scalar(info.get("mute_speaker"), 0))
+        no_speaker_slot = bool(_take_scalar(info.get("no_speaker_slot"), 0))
+        if mute_speaker and no_speaker_slot:
+            raise ValueError("Speaker slot cannot be both absent and muted")
+        if no_speaker_slot and any(
+            info.get(key) is not None for key in (KEY_SPEAKER_EMBEDDING, KEY_SPEAKER_WAVEFORM, "prompt_waveform")
+        ):
+            raise ValueError("No-speaker-slot conditioning cannot include speaker or prompt audio")
         prompt_generator = None
         if info.get("prompt_waveform") is not None:
             prompt_generator = self.model._get_request_generator(info, input_embeds.device)
-        prompt_latents = _resolve_prompt_latents(
-            self,
-            info,
-            generator=prompt_generator,
-            posterior_parameterization="softplus_scale",
+        prompt_latents = (
+            None
+            if mute_speaker or no_speaker_slot
+            else _resolve_prompt_latents(
+                self, info, generator=prompt_generator, posterior_parameterization="softplus_scale"
+            )
         )
         history = _initial_history(
             prompt_latents["frames"] if prompt_latents is not None else None,
@@ -183,13 +192,22 @@ class LingV3TTSForConditionalGeneration(
             state_keys.KEY_DECODE_STEP: 0,
         }
 
-        speakers = resolve_speaker_embeddings(self, info)
         slots = _find_speaker_placeholder_positions(input_ids, self.ming_config)
-        if len(slots) != 1 or len(speakers) != 1:
-            raise RuntimeError(f"LingV3 expected one speaker slot/embedding, got {len(slots)}/{len(speakers)}")
-        input_embeds[slots[0]] = self.model.project_speaker_embedding(
-            speakers[0].to(input_embeds.device, input_embeds.dtype).unsqueeze(0)
-        ).squeeze(0)
+        if no_speaker_slot:
+            if slots:
+                raise RuntimeError("No-speaker-slot conditioning must not contain speaker slots")
+        elif mute_speaker:
+            if len(slots) != 1:
+                raise RuntimeError("Masked speaker conditioning requires exactly one speaker slot")
+            input_embeds[slots[0]].zero_()
+        else:
+            speakers = resolve_speaker_embeddings(self, info)
+            if not slots or len(slots) != len(speakers):
+                raise RuntimeError(f"LingV3 speaker slot/embedding count mismatch: {len(slots)}/{len(speakers)}")
+            for slot, speaker in zip(slots, speakers, strict=True):
+                input_embeds[slot] = self.model.project_speaker_embedding(
+                    speaker.to(input_embeds.device, input_embeds.dtype).unsqueeze(0)
+                ).squeeze(0)
 
         if prompt_latents is not None:
             patches = prompt_latents["patches"].to(device=input_embeds.device, dtype=self.model.fm_dtype)
