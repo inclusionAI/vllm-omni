@@ -103,7 +103,9 @@ def test_post_sample_talker_mtp_uses_current_sample_and_hidden() -> None:
     )
 
     assert received["req_ids"] == ["ready"]
+    assert isinstance(received["input_ids"], torch.Tensor)
     assert received["input_ids"].tolist() == [101]
+    assert isinstance(received["hidden_states"], torch.Tensor)
     assert received["hidden_states"].tolist() == [[1.0, 2.0]]
     assert received["req_infos"] == [{"duplex": {"data_plane": True}}]
     assert runner.model_intermediate_buffer["ready"]["codes"]["audio"].tolist() == [[11, 12, 13]]
@@ -139,7 +141,9 @@ def test_post_sample_talker_mtp_uses_gpu_token_with_async_scheduling() -> None:
     )
 
     assert received["req_ids"] == ["ready"]
+    assert isinstance(received["input_ids"], torch.Tensor)
     assert received["input_ids"].tolist() == [101]
+    assert isinstance(received["hidden_states"], torch.Tensor)
     assert received["hidden_states"].tolist() == [[1.0, 2.0]]
     assert received["req_infos"] == [{"duplex": {"data_plane": True}}]
     assert multimodal["codes"]["audio"][0].tolist() == [[11, 12, 13]]
@@ -277,10 +281,15 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
     runner._pooler_payload_include_hidden_flag = True
     runner.input_batch = input_batch
+
+    def sample(logits, metadata):
+        received.append(metadata)
+        return "model-sampler"
+
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
         skips_model_sampler_output_token_history=True,
-        sample=lambda logits, metadata: received.append(metadata) or "model-sampler",
+        sample=sample,
     )
     runner.sampler = SimpleNamespace()
     logits = torch.zeros((1, 4))
@@ -1663,7 +1672,7 @@ class TestMergeModelKvTransferMetadata:
                 return {"talker_codes": [7], "seen_tokens": num_computed_tokens}
 
         original_meta = {"a": 1}
-        original = {"r1": {"seq_len": 3, "block_ids": [4], "custom_metadata": original_meta}}
+        original: dict[str, dict[str, Any]] = {"r1": {"seq_len": 3, "block_ids": [4], "custom_metadata": original_meta}}
         runner = self._runner_with_model(_Model())
 
         merged = runner._merge_model_kv_transfer_metadata(original)
@@ -1717,7 +1726,7 @@ class TestDownstreamPayloadMemoization:
         return runner
 
     def test_missing_marker_defaults_true_without_memoizing(self):
-        stages = {"r1": None}
+        stages: dict[str, int | None] = {"r1": None}
         runner = self._runner(stages)
 
         assert runner._request_needs_downstream_stage_payload("r1") is True

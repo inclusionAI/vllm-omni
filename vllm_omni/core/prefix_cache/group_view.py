@@ -10,7 +10,8 @@ returns None when the input batch has no block table.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, cast
 
 import torch
 
@@ -101,7 +102,7 @@ def check_prefix_cache_kv_groups(kv_cache_groups: object) -> None:
     Only needs ``kv_cache_config.kv_cache_groups``. ``FullAttentionSpec``
     is imported here so ``tests/core`` can load this module without vllm.
     """
-    groups = list(kv_cache_groups or ())
+    groups = list(cast(Iterable[object], kv_cache_groups or ()))
     if len(groups) != 1:
         raise OmniPrefixCacheUnmatchError(
             "omni prefix caching requires a single full-attention kv-cache group; "

@@ -445,7 +445,9 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             self._finalize_dump_data(dump=False)
             return hidden_states, hidden_states
 
-    def _model_forward(
+    # Ascend passes the padded token count positionally; keep its native
+    # signature when overriding the GPU helper in this multiple-inheritance adapter.
+    def _model_forward(  # type: ignore[override]
         self,
         num_tokens_padded: int,
         input_ids: torch.Tensor | None = None,
