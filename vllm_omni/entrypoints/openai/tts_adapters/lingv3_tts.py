@@ -183,7 +183,7 @@ class LingV3TTSAdapter(ARTTSAdapter):
         sampling_params_list: list,
         has_inline_ref_audio: bool,
     ) -> PreparedRequest:
-        del sampling_params_list, has_inline_ref_audio
+        del sampling_params_list
         server = self.ctx.server
         if server._tts_tokenizer is None:
             model_name = server.engine_client.model_config.model
@@ -193,16 +193,18 @@ class LingV3TTSAdapter(ARTTSAdapter):
                 trust_remote_code=trust_remote_code,
                 fix_mistral_regex=True,
             )
+        speaker_audio_keys = []
         waveform, sample_rate = None, None
         if request.ref_audio is not None:
             waveform, sample_rate = [], []
             references = request.ref_audio if isinstance(request.ref_audio, list) else [request.ref_audio]
             for source in references:
-                samples, rate, _ = await server._resolve_ref_audio(source)
+                samples, rate, resolved_key = await server._resolve_ref_audio(source)
                 waveform.append(torch.as_tensor(samples, dtype=torch.float32).reshape(1, -1))
                 sample_rate.append(int(rate))
+                speaker_audio_keys.append(server._get_resolved_ref_audio_artifact_key(resolved_key))
         max_steps = request.max_new_tokens
-        if max_steps is None and (waveform is None or len(waveform) <= 1):
+        if max_steps is None and len(speaker_audio_keys) <= 1:
             max_steps = int(self.tts_config.get("maximum_decode_steps", MAX_DECODE_STEPS))
         prompt_dict = build_lingv3_prompt(
             server._tts_tokenizer,
@@ -215,6 +217,13 @@ class LingV3TTSAdapter(ARTTSAdapter):
             max_decode_steps=max_steps,
             speaker_slot=not self._is_emergent(request),
         )
+        if speaker_audio_keys:
+            prompt_dict["additional_information"]["speaker_audio_keys"] = speaker_audio_keys
+        if request.voice and not has_inline_ref_audio and not isinstance(request.ref_audio, list):
+            voice_name = request.voice.lower()
+            if voice_name in server.uploaded_speakers:
+                prompt_dict["additional_information"]["voice_name"] = voice_name
+                prompt_dict["additional_information"]["voice_created_at"] = server._voice_created_at(voice_name)
         prompt = tokens_input(prompt_token_ids=prompt_dict["prompt_token_ids"])
         prompt["prompt"] = prompt_dict["prompt"]
         prompt["text"] = prompt_dict["text"]

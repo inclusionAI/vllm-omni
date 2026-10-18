@@ -72,6 +72,9 @@ class LingV3TTSForConditionalGeneration(
         self._speaker_extractor = None
 
         if self.model_stage == "llm":
+            from vllm_omni.utils.speaker_cache import get_speaker_cache
+
+            self._speaker_cache = get_speaker_cache()
             self.model = init_vllm_registered_model(
                 vllm_config=vllm_config,
                 architectures=["LingV3TTSLLMModel"],

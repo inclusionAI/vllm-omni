@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 import torch
+from vllm import SamplingParams
 
 from vllm_omni.model_executor.models.common.ming.cfm_cudagraph import CFMGraphExecutor
 from vllm_omni.model_executor.models.common.ming.continuous_tts import (
@@ -1012,3 +1013,178 @@ def test_online_emergent_omits_speaker_conditioning():
     assert ids[-1] == AUDIO_START_TOKEN_ID
     info = deserialize_additional_information(serialize_additional_information(prepared.tts_params))
     assert set(info) == {KEY_MAX_DECODE_STEPS, "no_speaker_slot"}
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_named_speaker_cache_reuses_only_matching_voice_version(wrapped):
+    from vllm_omni.model_executor.models.lingv3_tts.constants import KEY_SPEAKER_EMBEDDING, KEY_SPEAKER_WAVEFORM
+    from vllm_omni.model_executor.models.lingv3_tts.speaker_extractor import resolve_speaker_embeddings
+    from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
+
+    calls = []
+
+    def extract(waveform, sample_rate):
+        calls.append((waveform, sample_rate))
+        return torch.full((192,), float(len(calls)))
+
+    cache = SpeakerEmbeddingCache()
+    wrapper = SimpleNamespace(
+        _speaker_cache=cache,
+        _speaker_extractor=SimpleNamespace(extract_from_waveform=extract),
+        ming_config=SimpleNamespace(sample_rate=24000),
+    )
+    info = {KEY_SPEAKER_WAVEFORM: torch.zeros(1, 2400)}
+    for name, version, expected_calls in [("alice", 1, 1), ("alice", 1, 1), ("bob", 1, 2), ("alice", 2, 3)]:
+        info.update(
+            voice_name=[name] if wrapped else name, voice_created_at=torch.tensor([version]) if wrapped else version
+        )
+        embedding = resolve_speaker_embeddings(wrapper, info)[0]
+        assert len(calls) == expected_calls
+        assert torch.equal(embedding, torch.full((192,), float(expected_calls)))
+    assert cache.get(cache.make_cache_key("alice", "ming_tts", 1)) is None
+    direct = torch.zeros(192)
+    assert torch.equal(resolve_speaker_embeddings(wrapper, {**info, KEY_SPEAKER_EMBEDDING: direct})[0], direct)
+    assert len(calls) == 3
+    for _ in range(2):
+        resolve_speaker_embeddings(wrapper, {KEY_SPEAKER_WAVEFORM: info[KEY_SPEAKER_WAVEFORM]})
+    assert len(calls) == 5
+
+
+@pytest.mark.parametrize("inline", [False, True])
+@pytest.mark.parametrize("sft", [False, True])
+@pytest.mark.parametrize("max_tokens", [None, 100])
+def test_named_speaker_cache_metadata_excludes_inline_audio(inline, sft, max_tokens):
+    import asyncio
+
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+
+    async def resolve_audio(source):
+        return [0.0] * 2400, 24000, "audio-key"
+
+    server = SimpleNamespace(
+        engine_client=SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(tts_config={"maximum_decode_steps": 250} if sft else {})
+            )
+        ),
+        _tts_tokenizer=FakeTokenizer(),
+        _resolve_ref_audio=resolve_audio,
+        _get_resolved_ref_audio_artifact_key=lambda key: "content-key",
+        uploaded_speakers={"alice": {"created_at": 123}},
+        _voice_created_at=lambda name: 123,
+    )
+    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    request = OpenAICreateSpeechRequest(
+        input="Hello", voice="Alice", ref_audio="data:audio/wav;base64,AA==", max_new_tokens=max_tokens
+    )
+    prepared = asyncio.run(adapter.build(request, [], inline))
+    info = prepared.prompt["additional_information"]
+    maximum = max_tokens or (250 if sft else 800)
+    assert info[KEY_MAX_DECODE_STEPS] == maximum
+    sampling = adapter.apply_sampling_overrides([SamplingParams()], request)
+    assert sampling[0].max_tokens == maximum + 1
+    if inline:
+        assert "voice_name" not in info and "voice_created_at" not in info
+    else:
+        assert info["voice_name"] == "alice" and info["voice_created_at"] == 123
+
+
+def test_podcast_speaker_cache_reuses_individual_references():
+    from vllm_omni.model_executor.models.lingv3_tts.constants import (
+        KEY_SPEAKER_SAMPLE_RATES,
+        KEY_SPEAKER_WAVEFORM,
+        KEY_SPEAKER_WAVEFORM_LENGTHS,
+    )
+    from vllm_omni.model_executor.models.lingv3_tts.speaker_extractor import resolve_speaker_embeddings
+    from vllm_omni.utils.speaker_cache import SpeakerEmbeddingCache
+
+    calls = []
+
+    def extract(waveform, sample_rate):
+        calls.append((waveform.clone(), sample_rate))
+        return torch.full((192,), waveform[0, 0].item())
+
+    wrapper = SimpleNamespace(
+        _speaker_cache=SpeakerEmbeddingCache(),
+        _speaker_extractor=SimpleNamespace(extract_from_waveform=extract),
+        ming_config=SimpleNamespace(sample_rate=44100),
+        vllm_config=SimpleNamespace(model_config=SimpleNamespace(model="checkpoint-a")),
+    )
+
+    def resolve(keys, values):
+        return resolve_speaker_embeddings(
+            wrapper,
+            {
+                "speaker_audio_keys": keys,
+                KEY_SPEAKER_WAVEFORM: torch.tensor([values], dtype=torch.float32),
+                KEY_SPEAKER_WAVEFORM_LENGTHS: torch.tensor([1, 1]),
+                KEY_SPEAKER_SAMPLE_RATES: torch.tensor([16000, 16000]),
+            },
+        )
+
+    first = resolve(["audio-a", "audio-b"], [1, 2])
+    cached = resolve(["audio-a", "audio-b"], [1, 2])
+    assert len(calls) == 2
+    assert all(torch.equal(a, b) for a, b in zip(first, cached, strict=True))
+    reversed_speakers = resolve(["audio-b", "audio-a"], [2, 1])
+    assert len(calls) == 2
+    assert torch.equal(reversed_speakers[0], first[1])
+    assert torch.equal(reversed_speakers[1], first[0])
+    changed = resolve(["audio-a", "audio-c"], [1, 3])
+    assert len(calls) == 3 and torch.equal(changed[1], torch.full((192,), 3.0))
+    wrapper.vllm_config.model_config.model = "checkpoint-b"
+    resolve(["audio-a", "audio-b"], [1, 2])
+    assert len(calls) == 5
+    resolve([None, None], [1, 2])
+    resolve([None, None], [1, 2])
+    assert len(calls) == 9
+
+
+@pytest.mark.parametrize("references", ["1", ["1"], ["1", "2"]])
+@pytest.mark.parametrize("turn_text", ["你好。", "字" * 100])
+def test_adapter_transports_content_keys_without_caching_prompt_latents(references, turn_text):
+    import asyncio
+
+    from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+
+    async def resolve(source):
+        return [float(source)] * 8, 44100, "resolved-" + source
+
+    server = SimpleNamespace(
+        engine_client=SimpleNamespace(
+            model_config=SimpleNamespace(hf_config=SimpleNamespace(tts_config={"maximum_decode_steps": 250}))
+        ),
+        _tts_tokenizer=FakeTokenizer(),
+        _resolve_ref_audio=resolve,
+        _get_resolved_ref_audio_artifact_key=lambda key: {"resolved-1": "content-a", "resolved-2": "content-b"}[key],
+    )
+    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    request = OpenAICreateSpeechRequest(
+        input=f"speaker_1:{turn_text}\nspeaker_2:{turn_text}",
+        ref_audio=references,
+        ref_text="speaker_1:参考一。\nspeaker_2:参考二。",
+    )
+    for _ in range(2):
+        prepared = asyncio.run(adapter.build(request, [], True))
+        info = deserialize_additional_information(serialize_additional_information(prepared.tts_params))
+        assert info["speaker_audio_keys"] == (["content-a", "content-b"] if references == ["1", "2"] else ["content-a"])
+        assert "voice_name" not in info
+        assert "prompt_latents" not in info
+        assert isinstance(info["prompt_waveform"], torch.Tensor)
+        expected = [1.0] * 8 + ([2.0] * 8 if references == ["1", "2"] else [])
+        assert info["prompt_waveform"][0, : len(expected)].tolist() == expected
+        if references == ["1", "2"]:
+            minimum, maximum = (8, 24) if len(turn_text) == 3 else (200, 600)
+            assert int(info[KEY_MIN_DECODE_STEPS]) == minimum
+        else:
+            maximum = 250
+            assert KEY_MIN_DECODE_STEPS not in info
+        assert int(info[KEY_MAX_DECODE_STEPS]) == maximum
+        defaults = [SamplingParams(temperature=0.0, max_tokens=251)]
+        sampling = adapter.apply_sampling_overrides(defaults, request, prepared.prompt)
+        assert sampling[0].max_tokens == maximum + 1

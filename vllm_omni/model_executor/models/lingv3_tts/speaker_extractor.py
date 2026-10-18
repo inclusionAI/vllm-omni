@@ -34,6 +34,25 @@ def resolve_speaker_embeddings(wrapper: Any, info: dict[str, Any]) -> list[torch
         if embeddings:
             return embeddings
 
+    voice_name = info.get("voice_name")
+    if isinstance(voice_name, (list, tuple)):
+        voice_name = voice_name[0] if voice_name else None
+    created_at = info.get("voice_created_at", 0)
+    if isinstance(created_at, (list, tuple)):
+        created_at = created_at[0] if created_at else 0
+    if isinstance(created_at, torch.Tensor):
+        created_at = created_at.detach().reshape(-1)[0].item() if created_at.numel() else 0
+
+    cache_key = None
+    if isinstance(voice_name, str) and voice_name.strip():
+        cache = wrapper._speaker_cache
+        cache_key = cache.make_cache_key(voice_name, model_type="lingv3_tts", created_at=int(created_at or 0))
+        cached = cache.get(cache_key)
+        if cached is not None:
+            embeddings = coerce_speaker_embeddings(cached.get("speaker_embedding"))
+            if embeddings:
+                return embeddings
+
     waveform = info.get(KEY_SPEAKER_WAVEFORM)
     if waveform is None:
         raise ValueError("LingV3-TTS requires reference audio for speaker conditioning")
@@ -44,9 +63,29 @@ def resolve_speaker_embeddings(wrapper: Any, info: dict[str, Any]) -> list[torch
         raise ValueError("Each LingV3 reference audio clip requires a length and sample rate")
     if (lengths <= 0).any() or (sample_rates <= 0).any() or int(lengths.sum()) != waveform.shape[-1]:
         raise ValueError("Invalid LingV3 reference audio lengths or sample rates")
+    if cache_key is not None and lengths.numel() != 1:
+        raise ValueError("A named LingV3 voice must contain exactly one reference audio clip")
+
+    audio_keys = info.get("speaker_audio_keys")
+    if audio_keys is not None and len(audio_keys) != lengths.numel():
+        raise ValueError("LingV3 speaker cache keys must match the reference audio clips")
     embeddings = []
     offset = 0
-    for length, sample_rate in zip(lengths.tolist(), sample_rates.tolist(), strict=True):
+    for index, (length, sample_rate) in enumerate(zip(lengths.tolist(), sample_rates.tolist(), strict=True)):
+        reference_key = None
+        if audio_keys is not None and audio_keys[index]:
+            cache = wrapper._speaker_cache
+            reference_key = cache.make_cache_key(
+                audio_keys[index], model_type=f"lingv3_tts.reference:{wrapper.vllm_config.model_config.model}"
+            )
+            cached = cache.get(reference_key)
+            if cached is not None:
+                extracted = coerce_speaker_embeddings(cached.get("speaker_embedding"))
+                if len(extracted) != 1:
+                    raise RuntimeError("Invalid cached LingV3 reference speaker embedding")
+                embeddings.extend(extracted)
+                offset += length
+                continue
         extractor = getattr(wrapper, "_speaker_extractor", None)
         if extractor is None:
             with _LOAD_LOCK:
@@ -58,8 +97,12 @@ def resolve_speaker_embeddings(wrapper: Any, info: dict[str, Any]) -> list[torch
         extracted = coerce_speaker_embeddings(embedding)
         if len(extracted) != 1:
             raise RuntimeError("CAM++ must return one LingV3 speaker embedding per reference clip")
+        if reference_key is not None:
+            cache.put(reference_key, {"speaker_embedding": extracted[0]})
         embeddings.extend(extracted)
         offset += length
+    if cache_key is not None:
+        cache.put(cache_key, {"speaker_embedding": embeddings[0]})
     return embeddings
 
 
