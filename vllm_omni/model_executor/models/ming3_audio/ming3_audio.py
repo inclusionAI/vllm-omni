@@ -54,6 +54,7 @@ from .processing import (
 )
 
 _SAMPLE_RATE = 16000
+_WHISPER_ENCODER_BATCH_SIZE = 32
 
 
 class Ming3AudioStreamingPostProcessor(StreamingTranscriptionPostProcessor):
@@ -159,14 +160,26 @@ class BailingMoeV3AudioForConditionalGeneration(
         features = features.reshape(-1, features.shape[-1])[:feature_length]
         chunk_lengths = iter_chunk_lengths(feature_length, self.config.audio_config.whisper_chunk_size)
         chunks = list(features.split(chunk_lengths))
-        chunk_batch = nn.utils.rnn.pad_sequence(chunks, batch_first=True)
-        encoded, encoded_lengths = self.audio_encoder.forward_padded(chunk_batch, list(chunk_lengths))
-        projected = self.audio_projector(encoded)
-        projected_lengths = [self.audio_projector.output_length(length) for length in encoded_lengths]
-        embeddings = torch.cat(
-            [projected[index, :length] for index, length in enumerate(projected_lengths)],
-            dim=0,
-        )
+        padded_length = max(chunk_lengths)
+        embedding_batches = []
+        for start in range(0, len(chunks), _WHISPER_ENCODER_BATCH_SIZE):
+            batch_lengths = list(chunk_lengths[start : start + _WHISPER_ENCODER_BATCH_SIZE])
+            chunk_batch = nn.utils.rnn.pad_sequence(
+                chunks[start : start + _WHISPER_ENCODER_BATCH_SIZE], batch_first=True
+            )
+            # The unmasked encoder must retain the original global padding,
+            # even when the final microbatch contains only a short tail.
+            if chunk_batch.shape[1] < padded_length:
+                chunk_batch = F.pad(chunk_batch, (0, 0, 0, padded_length - chunk_batch.shape[1]))
+            encoded, encoded_lengths = self.audio_encoder.forward_padded(chunk_batch, batch_lengths)
+            projected = self.audio_projector(encoded)
+            projected_lengths = [self.audio_projector.output_length(length) for length in encoded_lengths]
+            # Compact valid outputs so views do not retain padded activations.
+            embedding_batches.append(
+                torch.cat([projected[index, :length] for index, length in enumerate(projected_lengths)], dim=0)
+            )
+            del encoded, projected
+        embeddings = embedding_batches[0] if len(embedding_batches) == 1 else torch.cat(embedding_batches, dim=0)
         if self.config.norm_query_embeds:
             embeddings = F.normalize(embeddings, dim=-1)
         return embeddings
