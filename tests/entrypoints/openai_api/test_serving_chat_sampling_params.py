@@ -14,6 +14,7 @@ from typing import Any, cast
 import pytest
 from pytest_mock import MockerFixture
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
+from vllm.exceptions import VLLMValidationError
 from vllm.sampling_params import SamplingParams
 
 from tests.helpers.serving_chat import build_serving_chat
@@ -976,3 +977,48 @@ def test_existing_extra_args_are_merged_not_replaced():
     ar = SamplingParams(extra_args={"custom": 1})
     _apply_tag([ar], None)
     assert ar.extra_args == {"custom": 1, "ar_task_mode": "comprehension"}
+
+
+@pytest.mark.parametrize("token_field", ["max_tokens", "max_completion_tokens"])
+def test_partial_stage_params_inherit_request_and_deploy_defaults(mock_engine_client, token_field):
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    defaults = mock_engine_client.default_sampling_params_list
+    defaults[0].extra_args = {"deploy_option": True}
+    request = ChatCompletionRequest(model="test", messages=[], temperature=0, **{token_field: 256})
+
+    result = instance._to_sampling_params_list([{"extra_args": {"no_repeat_ngram_size": 10}}], request=request)
+
+    assert result[0].max_tokens == 256
+    assert result[0].temperature == 0
+    assert result[0].repetition_penalty == defaults[0].repetition_penalty
+    assert result[0].extra_args == {"deploy_option": True, "no_repeat_ngram_size": 10}
+    assert result[1].max_tokens == defaults[1].max_tokens
+    assert defaults[0].max_tokens == 4353
+    assert defaults[0].extra_args == {"deploy_option": True}
+
+
+def test_explicit_stage_params_override_top_level_request(mock_engine_client):
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    request = ChatCompletionRequest(model="test", messages=[], max_tokens=256, temperature=0)
+    result = instance._to_sampling_params_list([{"max_tokens": 64, "temperature": 0.7}], request=request)
+    assert result[0].max_tokens == 64
+    assert result[0].temperature == 0.7
+
+
+def test_partial_stage_params_validate_max_tokens(mock_engine_client):
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    with pytest.raises(VLLMValidationError):
+        instance._to_sampling_params_list([{"max_tokens": 0}])
+
+
+def test_partial_stage_params_without_request_preserve_yaml_defaults(mock_engine_client):
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    result = instance._to_sampling_params_list([{"extra_args": {"no_repeat_ngram_size": 10}}])
+    assert result[0].max_tokens == 4353
+    assert result[0].temperature == 0.4
+
+
+def test_max_completion_tokens_takes_precedence(mock_engine_client):
+    instance = build_serving_chat(engine_client=mock_engine_client)
+    request = ChatCompletionRequest(model="test", messages=[], max_tokens=256, max_completion_tokens=512)
+    assert instance._build_sampling_params_list_from_request(request)[0].max_tokens == 512

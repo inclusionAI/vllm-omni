@@ -841,7 +841,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if self.enable_prompt_tokens_details:
                     mm_token_counts = _get_mm_token_counts(engine_prompt)
                 if hasattr(request, "sampling_params_list"):
-                    sampling_params_list = self._to_sampling_params_list(request.sampling_params_list)
+                    sampling_params_list = self._to_sampling_params_list(request.sampling_params_list, request=request)
                 else:
                     # Use standard OpenAI API parameters for comprehension stage
                     sampling_params_list = self._build_sampling_params_list_from_request(request)
@@ -1311,8 +1311,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return new_messages
 
-    def _to_sampling_params_list(self, sampling_params_list: list[dict]) -> list[Any]:
+    def _to_sampling_params_list(
+        self, sampling_params_list: list[dict], request: ChatCompletionRequest | None = None
+    ) -> list[Any]:
         """Convert request dicts to stage-typed sampling params objects.
+
+        Partial LLM dictionaries inherit deploy defaults, then explicit top-level
+        request parameters on the comprehension stage. Explicit stage fields win.
 
         For diffusion stages, build ``OmniDiffusionSamplingParams`` so
         downstream ``StageDiffusionClient._sampling_params_to_dict`` (which
@@ -1328,7 +1333,32 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             stage_type = get_stage_type(stage_configs[idx]) if idx < len(stage_configs) else "llm"
             target_cls = OmniDiffusionSamplingParams if stage_type == "diffusion" else SamplingParams
             if isinstance(sampling_params, dict):
-                final_sampling_params_list.append(target_cls(**sampling_params))
+                if target_cls is SamplingParams:
+                    base = (
+                        clone_sampling_params(default_params_list[idx])
+                        if idx < len(default_params_list)
+                        else SamplingParams()
+                    )
+                    if isinstance(base, dict):
+                        base = SamplingParams(**base)
+                    if (
+                        request is not None
+                        and idx < len(stage_configs)
+                        and getattr(stage_configs[idx], "is_comprehension", False)
+                    ):
+                        base = self._apply_request_overrides(base, request)
+                    # Reconstruct to validate overrides and recompute derived fields.
+                    merged = {
+                        name: getattr(base, name)
+                        for name in SamplingParams.__struct_fields__
+                        if not name.startswith("_")
+                    }
+                    merged.update(sampling_params)
+                    if isinstance(base.extra_args, dict) and isinstance(sampling_params.get("extra_args"), dict):
+                        merged["extra_args"] = {**base.extra_args, **sampling_params["extra_args"]}
+                    final_sampling_params_list.append(SamplingParams(**merged))
+                else:
+                    final_sampling_params_list.append(target_cls(**sampling_params))
             elif isinstance(sampling_params, target_cls):
                 final_sampling_params_list.append(sampling_params)
             elif isinstance(sampling_params, SamplingParams | OmniDiffusionSamplingParams):
@@ -1383,7 +1413,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         Starts with YAML defaults and only overrides fields that the user
         explicitly provided (non-None values) in the request.
 
-        max_tokens is NOT computed dynamically — it uses the deploy YAML default.
+        max_tokens uses the deploy YAML default unless explicitly overridden.
 
         Args:
             default_params: Default SamplingParams from the resolved pipeline and deploy configuration.
@@ -1407,6 +1437,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             value = getattr(request, field_name, None)
             if (value is not None and not isinstance(value, list)) or (isinstance(value, list) and len(value) > 0):
                 setattr(params, field_name, value)
+
+        if "max_completion_tokens" in explicit_fields and request.max_completion_tokens is not None:
+            params.max_tokens = request.max_completion_tokens
 
         return params
 
