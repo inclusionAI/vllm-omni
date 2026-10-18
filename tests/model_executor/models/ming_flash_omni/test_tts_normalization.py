@@ -34,6 +34,39 @@ def test_selected_profile_defaults_reach_talker_without_request_overrides():
     assert resolve_generation_params(info, MingFlashOmniTalkerConfig()).tn_mode == "legacy"
 
 
+@pytest.mark.parametrize("profile", ["ming3_audio_flash.yaml", "ming3_audio_tiny.yaml"])
+def test_ming3_profiles_keep_legacy_audio_collection(profile):
+    root = Path(__file__).resolve().parents[4]
+    deploy = load_deploy_config(root / "vllm_omni/deploy" / profile)
+    overrides = deploy.stages[1].engine_extras["hf_overrides"]
+    assert overrides["low_latency_streaming"] is False
+    assert MingFlashOmniTalkerConfig.from_dict({}, **overrides).low_latency_streaming is False
+    # Shared Ming2 and strict checkpoint loading retain their polling default.
+    assert MingFlashOmniTalkerConfig().low_latency_streaming is False
+    assert MingFlashOmniTalkerConfig(strict_weight_loading=True).low_latency_streaming is False
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_talker_forwards_collection_policy_to_each_streaming_job(mocker, enabled):
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.models.ming_flash_omni import ming_flash_omni_talker as talker
+
+    model = mocker.Mock()
+    model._stream_jobs = {}
+    model.device = torch.device("cpu")
+    model.config = MingFlashOmniTalkerConfig(low_latency_streaming=enabled)
+    model.audio_vae.config.sample_rate = 24000
+    create = mocker.patch.object(talker, "MingStreamingJob")
+    create.return_value.next_audio.return_value = (torch.ones(1, 1, 4), False)
+    talker.MingFlashOmniTalkerForConditionalGeneration._stream_forward(
+        model, "request", None, None, {}, SimpleNamespace(seed=None)
+    )
+    assert create.call_args.kwargs == {"low_latency_streaming": enabled}
+
+
 def test_explicit_legacy_and_disabled_normalization_override_profile():
     info = build_ming_talker_additional_info(
         "原始文字。", {"normalize_text": False, "tn_mode": "legacy", "stream_decode": False, "seed": 123}

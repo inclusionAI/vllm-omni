@@ -13,6 +13,8 @@ enable_chunked_prefill: true
 
 stages:
   - stage_id: 0
+    limit_mm_per_prompt:
+      audio: 1
     devices: "0,1,2,3"
     tensor_parallel_size: 4
     enable_expert_parallel: false
@@ -45,6 +47,7 @@ stages:
       cudagraph_mode: NONE
     engine_extras:
       hf_overrides:
+        low_latency_streaming: false
         normalize_text: true
         tn_mode: upstream
     default_sampling_params:

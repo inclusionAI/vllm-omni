@@ -91,6 +91,12 @@ class BailingMoeV3AudioForConditionalGeneration(
 ):
     """Whisper encoder + projector + native vLLM Bailing-MoE-v3 decoder."""
 
+    # Downstream speech synthesis consumes generated text tokens only. Native
+    # hybrid KV/recurrent-state caching needs no Omni prefix-output replay.
+    requires_full_prefix_cached_hidden_states = False
+    uses_native_kv_cache_only = True
+    omni_pooler_payload_include_hidden = False
+
     supported_languages: Mapping[str, str] = {}
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
@@ -170,9 +176,10 @@ class BailingMoeV3AudioForConditionalGeneration(
         audio_feats: object,
         audio_feats_lengths: object,
     ) -> tuple[list[torch.Tensor], list[int]]:
-        lengths = [int(length) for length in torch.as_tensor(audio_feats_lengths).flatten() if int(length) > 0]
+        lengths = [int(length) for length in torch.as_tensor(audio_feats_lengths).flatten()]
         if isinstance(audio_feats, (list, tuple)):
-            features = [torch.as_tensor(item).squeeze(0) for item in audio_feats]
+            features = [torch.as_tensor(item) for item in audio_feats]
+            features = [item.squeeze(0) if item.ndim == 3 and item.shape[0] == 1 else item for item in features]
         else:
             tensor = torch.as_tensor(audio_feats)
             if tensor.ndim == 2:
@@ -185,6 +192,11 @@ class BailingMoeV3AudioForConditionalGeneration(
                 raise ValueError("audio_feats must be [time, mel], [items, time, mel], or [items, 1, time, mel]")
         if len(features) != len(lengths):
             raise ValueError(f"Received {len(features)} audio feature tensors but {len(lengths)} lengths")
+        for feature, length in zip(features, lengths, strict=True):
+            if feature.ndim != 2:
+                raise ValueError("Each audio feature tensor must have shape [time, mel]")
+            if not 0 < length <= feature.shape[0]:
+                raise ValueError(f"Audio feature length {length} must be positive and fit {feature.shape[0]} frames")
         return features, lengths
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:

@@ -31,6 +31,8 @@ class MingFlashOmniTalkerConfig(PretrainedConfig):
         campplus_model: str | None = None,
         max_decode_steps: int = 200,
         max_cache_len: int = 2048,
+        enable_llm_cuda_graph: bool = False,
+        low_latency_streaming: bool = False,
         strict_weight_loading: bool = False,
         normalize_text: bool = True,
         scrub_markup: bool = False,
@@ -52,6 +54,8 @@ class MingFlashOmniTalkerConfig(PretrainedConfig):
         self.campplus_model = campplus_model
         self.max_decode_steps = max_decode_steps
         self.max_cache_len = max_cache_len
+        self.enable_llm_cuda_graph = enable_llm_cuda_graph
+        self.low_latency_streaming = low_latency_streaming
         self.strict_weight_loading = strict_weight_loading
         self.normalize_text = normalize_text
         self.scrub_markup = scrub_markup

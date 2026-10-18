@@ -22,6 +22,7 @@
 # MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
 # --------------------------------------------------------
 import logging
+from contextlib import nullcontext
 from functools import cached_property
 from queue import Queue
 from threading import Lock
@@ -48,6 +49,8 @@ from vllm_omni.model_executor.models.model_local_kv import (
     RowDriver,
     spec_from_hf_config,
 )
+
+from .talker_llm_graph import Qwen2DecodeGraph
 
 logger = init_logger(__name__)
 
@@ -582,6 +585,7 @@ class MingAudioGenerator:
         latent_dim: int,
         cfg_strength: float,
         use_cuda_graphs: bool,
+        enable_llm_cuda_graph: bool = False,
     ) -> None:
         self._config = config
         self._llm_config = llm_config
@@ -597,7 +601,11 @@ class MingAudioGenerator:
         self.cfg_strength = cfg_strength
 
         self._use_cuda_graphs = use_cuda_graphs
+        self._enable_llm_cuda_graph = enable_llm_cuda_graph and use_cuda_graphs
         self._max_cache_len = int(getattr(config, "max_cache_len", self._STATIC_CACHE_LEN))
+        self._llm_graph = (
+            Qwen2DecodeGraph(self._model, max_cache_len=self._max_cache_len) if self._enable_llm_cuda_graph else None
+        )
 
     def model_local_kv_specs(self) -> list[ModelLocalKVSpec]:
         """Declare the talker's preallocated decode cache.
@@ -622,23 +630,28 @@ class MingAudioGenerator:
         earlier revision did, by deriving the multiplier from scope -- reported
         ``max_num_seqs`` times the real figure.
 
-        The caveat is that nothing enforces the serialization. ``StaticCache``
-        is built outside ``_sampler_pool``'s lock, so overlapping calls to
-        ``generate_latents`` would coexist. If this model ever gains a
-        concurrent entry point, this row count is the line to revisit.
+        With LLM graphs enabled, a request lock serializes the entire AR loop
+        and the persistent cache is reset before and after each text segment.
+        Without LLM graphs, each invocation owns a separate request-local cache.
         """
+        max_cache_len = getattr(self, "_max_cache_len", self._STATIC_CACHE_LEN)
+        resident = getattr(self, "_enable_llm_cuda_graph", False)
         return [
             spec_from_hf_config(
                 self._llm_config,
                 name="talker_llm_static_cache",
                 dtype=next(self._model.parameters()).dtype,
-                physical_capacity_positions=self._max_cache_len,
-                capacity_source=f"talker config max_cache_len={self._max_cache_len}",
-                scope=ModelLocalKVScope.REQUEST,
+                physical_capacity_positions=max_cache_len,
+                capacity_source=f"talker config max_cache_len={max_cache_len}",
+                scope=ModelLocalKVScope.MODEL if resident else ModelLocalKVScope.REQUEST,
                 rows=RowDriver.FIXED,
                 rows_fixed=1,
                 rows_reason="one active Talker request per worker, including background streaming generation",
-                allocation_note="full extent on first write per layer, not grown; rebuilt per text segment",
+                allocation_note=(
+                    "resident static cache reset between text segments"
+                    if resident
+                    else "full extent on first write per layer, not grown; rebuilt per text segment"
+                ),
             )
         ]
 
@@ -682,53 +695,56 @@ class MingAudioGenerator:
         on_latent=None,
     ) -> list[torch.Tensor]:
         """Autoregressive LLM + CFM sampling loop"""
-        if cfg is None:
-            cfg = self.cfg_strength
-        device = next(self._model.parameters()).device
-        dtype = next(self._model.parameters()).dtype
+        graph = self._llm_graph if use_static_cache else None
+        with graph.request(inputs_embeds) if graph is not None else nullcontext():
+            if cfg is None:
+                cfg = self.cfg_strength
+            device = next(self._model.parameters()).device
+            dtype = next(self._model.parameters()).dtype
 
-        his_lat = self._init_his_lat(prompt_wav_lat, device, dtype)
-        past_key_values, max_cache_len = self._init_kv_cache(use_static_cache, device, dtype)
-        prefill_len = inputs_embeds.shape[1]
-        if prefill_len >= max_cache_len:
-            raise ValueError(f"TTS prompt has {prefill_len} positions, exceeding cache limit {max_cache_len}")
-        all_latents: list[torch.Tensor] = []
+            his_lat = self._init_his_lat(prompt_wav_lat, device, dtype)
+            past_key_values, max_cache_len = self._init_kv_cache(use_static_cache, device, dtype)
+            prefill_len = inputs_embeds.shape[1]
+            if prefill_len >= max_cache_len:
+                raise ValueError(f"TTS prompt has {prefill_len} positions, exceeding cache limit {max_cache_len}")
+            all_latents: list[torch.Tensor] = []
 
-        for step in range(min(max_steps, max_cache_len - prefill_len)):
-            last_hs = self.llm_step(
-                inputs_embeds,
-                step=step,
-                past_key_values=past_key_values,
-                use_static_cache=use_static_cache,
-            )
-            gen_lat, inputs_embeds, stop_out = self.cfm_sample_step(
-                last_hs, his_lat, cfg=cfg, sigma=sigma, temperature=temperature
-            )
-            his_lat = self._update_his_lat(his_lat, gen_lat)
-            all_latents.append(gen_lat)
+            for step in range(min(max_steps, max_cache_len - prefill_len)):
+                last_hs = self.llm_step(
+                    inputs_embeds,
+                    step=step,
+                    past_key_values=past_key_values,
+                    use_static_cache=use_static_cache,
+                    position=prefill_len + step - 1,
+                )
+                gen_lat, inputs_embeds, stop_out = self.cfm_sample_step(
+                    last_hs, his_lat, cfg=cfg, sigma=sigma, temperature=temperature
+                )
+                his_lat = self._update_his_lat(his_lat, gen_lat)
+                all_latents.append(gen_lat)
 
-            stop_prob = stop_out.cpu()[0, 1].item()
+                stop_prob = stop_out.cpu()[0, 1].item()
 
-            if logger.isEnabledFor(logging.DEBUG):
-                if step % 50 == 0 or step < 5:
-                    logger.debug(
-                        "step=%d stop_prob=%.4f hs_norm=%.4f lat_norm=%.4f emb_norm=%.4f",
-                        step,
-                        stop_prob,
-                        last_hs.float().norm().item(),
-                        gen_lat.float().norm().item(),
-                        inputs_embeds.float().norm().item(),
-                    )
+                if logger.isEnabledFor(logging.DEBUG):
+                    if step % 50 == 0 or step < 5:
+                        logger.debug(
+                            "step=%d stop_prob=%.4f hs_norm=%.4f lat_norm=%.4f emb_norm=%.4f",
+                            step,
+                            stop_prob,
+                            last_hs.float().norm().item(),
+                            gen_lat.float().norm().item(),
+                            inputs_embeds.float().norm().item(),
+                        )
 
-            stopped = step > min_new_token and stop_prob > stop_threshold
-            last = stopped or step + 1 == min(max_steps, max_cache_len - prefill_len)
-            if on_latent is not None:
-                on_latent(gen_lat, last)
-            if stopped:
-                logger.debug("Stopping at step %d with stop_prob=%.4f", step, stop_prob)
-                break
+                stopped = step > min_new_token and stop_prob > stop_threshold
+                last = stopped or step + 1 == min(max_steps, max_cache_len - prefill_len)
+                if on_latent is not None:
+                    on_latent(gen_lat, last)
+                if stopped:
+                    logger.debug("Stopping at step %d with stop_prob=%.4f", step, stop_prob)
+                    break
 
-        return all_latents
+            return all_latents
 
     def cfm_sample_step(
         self,
@@ -794,7 +810,13 @@ class MingAudioGenerator:
         step: int,
         past_key_values: StaticCache | None,
         use_static_cache: bool,
+        position: int | None = None,
     ) -> torch.Tensor:
+        graph = self._llm_graph if use_static_cache else None
+        if step > 0 and graph is not None and past_key_values is graph.cache and position is not None:
+            output = graph.decode(inputs_embeds, position=position)
+            if output is not None:
+                return output[:, -1:, :]
         if step == 0 or not use_static_cache:
             outputs = self._model(
                 past_key_values=past_key_values,
@@ -834,6 +856,8 @@ class MingAudioGenerator:
         max_cache_len = self._max_cache_len
         if not use_static_cache:
             return None, max_cache_len
+        if self._llm_graph is not None and self._llm_graph.active:
+            return self._llm_graph.cache, max_cache_len
         cache = StaticCache(
             config=self._llm_config,
             max_batch_size=1,

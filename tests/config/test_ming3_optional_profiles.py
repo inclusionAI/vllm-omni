@@ -60,3 +60,21 @@ def test_flash_128k_overlay_preserves_base_execution_settings(variant):
     base["stages"][0].update(max_model_len=131072, max_num_batched_tokens=32768)
     base["stages"][0]["default_sampling_params"]["max_tokens"] = 32768 if variant == "_asr" else 65536
     assert extended == base
+
+
+def test_ming3_history_cache_profile_reaches_legacy_and_structured_builders():
+    deploy = load_deploy_config(_DEPLOY / "ming3_audio_flash_history_cache.yaml")
+    pipeline = resolve_pipeline_config(deploy.pipeline)
+    assert pipeline is not None
+    legacy = merge_pipeline_deploy(pipeline, deploy)
+    structured = VllmOmniConfig.from_pipeline_config(pipeline, user_deploy_config=deploy)
+    thinker, talker = structured.stage_by_id(0), structured.stage_by_id(1)
+    assert thinker.cache_config.enable_prefix_caching is True
+    assert thinker.cache_config.mamba_cache_mode == "align"
+    assert thinker.scheduler_config.enable_chunked_prefill is True
+    assert thinker.model_config.limit_mm_per_prompt == {"audio": 16}
+    assert talker.cache_config.enable_prefix_caching is False
+    assert legacy[0].yaml_engine_args["enable_prefix_caching"] is True
+    assert legacy[0].yaml_engine_args["mamba_cache_mode"] == "align"
+    assert legacy[0].yaml_engine_args["limit_mm_per_prompt"] == {"audio": 16}
+    assert legacy[1].yaml_engine_args["enable_prefix_caching"] is False

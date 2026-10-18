@@ -53,6 +53,7 @@ from vllm_omni.utils.mm_outputs import (
     snapshot_mm_payload,
 )
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.mamba_prefix_cache import prepare_mamba_prefix_cache
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
     needs_omni_connector,
@@ -1033,6 +1034,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 self.parallel_config.num_ubatches,
             )
             pad_attn = cudagraph_mode == CUDAGraphMode.FULL or runner_assisted_full_attn
+
+            deferred_state_corrections_fn = prepare_mamba_prefix_cache(
+                self, scheduler_output, num_reqs, deferred_state_corrections_fn
+            )
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices

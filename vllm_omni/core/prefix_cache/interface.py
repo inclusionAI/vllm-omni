@@ -147,6 +147,14 @@ class ModelCachePolicy:
     # immediate on-device clone / device→host path.
     deferred_keys: frozenset[TensorName] = frozenset()
 
+    # Explicit opt-in for token-only stages that need native KV/recurrent
+    # state reuse, but no replay of prefix hidden states or multimodal outputs.
+    native_kv_cache_only: bool = False
+
+    def __post_init__(self) -> None:
+        if self.native_kv_cache_only and (self.needs_full_hidden_states or self.deferred_keys):
+            raise ValueError("native KV-only caching cannot replay prefix hidden states or multimodal outputs")
+
     @property
     def hidden_key(self) -> TensorName | None:
         """Pool key for hidden, or None when this model opts out."""
@@ -168,4 +176,5 @@ class ModelCachePolicy:
         return cls(
             needs_full_hidden_states=bool(getattr(model, "requires_full_prefix_cached_hidden_states", True)),
             deferred_keys=deferred,
+            native_kv_cache_only=bool(getattr(model, "uses_native_kv_cache_only", False)),
         )

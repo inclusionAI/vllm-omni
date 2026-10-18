@@ -4,6 +4,7 @@
 
 from queue import Empty, Full, Queue
 from threading import Event, Thread
+from time import monotonic
 
 import torch
 
@@ -13,17 +14,22 @@ class _CancelledError(Exception):
 
 
 class MingStreamingJob:
-    """Generate on a separate CUDA stream and decode new tokens every 100 ms.
+    """Generate on a separate CUDA stream and wake the decoder for ready data.
 
     The producer marks the final latent, so even a one-chunk utterance can
     flush the VAE without submitting an empty latent or duplicating a frame.
+    By default, wait for the polling interval and then drain ready latents.
+    With low_latency_streaming, decode the first audio as soon as latents are
+    ready, then coalesce within the polling budget and flush final latents
+    immediately. This changes VAE chunk boundaries and is an explicit opt-in.
     The bounded queue applies backpressure to slow consumers.
     """
 
-    def __init__(self, produce, vae, device, poll_seconds=0.1):
+    def __init__(self, produce, vae, device, poll_seconds=0.1, *, low_latency_streaming=False):
         self.vae = vae
         self.device = device
-        self.poll_seconds = poll_seconds
+        self.poll_seconds = float(poll_seconds)
+        self.low_latency_streaming = low_latency_streaming
         self.queue = Queue(maxsize=32)
         self.cancelled = Event()
         self.done = Event()
@@ -31,13 +37,18 @@ class MingStreamingJob:
         self.past_key_values = None
         self.stream_state = (None, None, None)
         self.finished = False
+        self._has_audio_output = False
         # The caller may have cloned input tensors on its current stream.
         ready = torch.cuda.Event()
         ready.record(torch.cuda.current_stream(device))
 
         def run():
             try:
-                with torch.inference_mode(), torch.cuda.device(device), torch.cuda.stream(torch.cuda.Stream(device)):
+                with (
+                    torch.inference_mode(),
+                    torch.accelerator.device_index(device.index),
+                    torch.cuda.stream(torch.cuda.Stream(device)),
+                ):
                     torch.cuda.current_stream().wait_event(ready)
                     produce(self._publish)
             except _CancelledError:
@@ -62,24 +73,54 @@ class MingStreamingJob:
         raise _CancelledError()
 
     def next_audio(self):
-        self.cancelled.wait(self.poll_seconds)
-        if self.error is not None:
-            raise self.error
+        # Initial waiting and later coalescing share one budget per call.
+        deadline = monotonic() + self.poll_seconds
+        if not self.low_latency_streaming:
+            # Preserve legacy Ming collection: wait once, then drain without
+            # waiting for subsequent arrivals. VAE numerics can depend on the
+            # resulting chunk boundaries, even when the latents are identical.
+            self.cancelled.wait(self.poll_seconds)
         parts = []
         last = False
-        while True:
+        while not last:
+            if self.cancelled.is_set():
+                raise _CancelledError()
+            if self.error is not None:
+                raise self.error
             try:
                 latent, last = self.queue.get_nowait()
             except Empty:
-                break
+                if self.done.is_set():
+                    # Completion follows the last put. Recheck after observing
+                    # done: the producer may have finished after our empty read.
+                    try:
+                        latent, last = self.queue.get_nowait()
+                    except Empty as exc:
+                        if self.cancelled.is_set():
+                            raise _CancelledError()
+                        if self.error is not None:
+                            raise self.error
+                        if not parts:
+                            raise RuntimeError("Ming latent producer ended without a final latent") from exc
+                        break
+                else:
+                    if not self.low_latency_streaming or (parts and not self._has_audio_output):
+                        break
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        # A put wakes this immediately. Once audio has started,
+                        # collect subsequent latents only within this deadline.
+                        latent, last = self.queue.get(timeout=remaining)
+                    except Empty:
+                        continue
             parts.append(latent)
-            if last:
-                break
+        if self.cancelled.is_set():
+            raise _CancelledError()
+        if self.error is not None:
+            raise self.error
         if not parts:
-            if self.done.is_set():
-                if self.error is not None:
-                    raise self.error
-                raise RuntimeError("Ming latent producer ended without a final latent")
             return torch.empty(1, 1, 0, device=self.device), False
         audio, self.stream_state, self.past_key_values = self.vae.decode(
             torch.cat(parts, dim=1),
@@ -89,6 +130,8 @@ class MingStreamingJob:
             last_chunk=last,
         )
         self.finished = last
+        if audio.numel():
+            self._has_audio_output = True
         return audio, last
 
     def close(self):

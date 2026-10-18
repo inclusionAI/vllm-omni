@@ -83,13 +83,15 @@ class Ming3RealtimeConnection(RealtimeConnection):
             elif kind == "input_audio_buffer.commit":
                 if not self._input_audio:
                     raise ValueError("Cannot commit an empty audio buffer")
-                buffer = io.BytesIO()
-                sf.write(buffer, np.frombuffer(self._input_audio, dtype="<i2"), 24000, format="WAV", subtype="PCM_16")
                 item = {
                     "type": "message",
                     "role": "user",
                     "content": [
-                        {"type": "input_audio", "audio": base64.b64encode(buffer.getvalue()).decode(), "format": "wav"}
+                        {
+                            "type": "input_audio",
+                            "audio": base64.b64encode(self._input_audio).decode(),
+                            "format": "pcm16",
+                        }
                     ],
                 }
                 await self._add_item(item)
@@ -239,17 +241,37 @@ class Ming3RealtimeConnection(RealtimeConnection):
         content = []
         for part in parts:
             if part.get("type") in {"input_text", "text"}:
+                if not isinstance(part.get("text"), str):
+                    raise ValueError("Conversation text must be a string")
                 content.append({"type": "text", "text": part["text"]})
             elif part.get("type") == "input_audio":
-                # conversation.item.create audio uses raw PCM16; the internal
-                # committed-buffer item is explicitly marked as WAV.
+                fmt = part.get("format", "pcm16")
+                if fmt not in {"pcm16", "wav"}:
+                    raise ValueError("Conversation audio format must be pcm16 or wav")
                 audio = base64.b64decode(part["audio"], validate=True)
-                if part.get("format") != "wav":
+                if not audio:
+                    raise ValueError("Conversation audio cannot be empty")
+                if len(audio) > self._max_audio_filesize_mb * 1024**2:
+                    raise ValueError("Conversation audio exceeds maximum size")
+                if fmt == "wav":
+                    try:
+                        info = sf.info(io.BytesIO(audio))
+                    except sf.LibsndfileError as exc:
+                        raise ValueError("Invalid WAV audio") from exc
+                    if info.format not in {"WAV", "WAVEX", "RF64"}:
+                        raise ValueError("Conversation audio must contain WAV data")
+                    if not info.frames:
+                        raise ValueError("Conversation audio cannot be empty")
+                else:
                     if len(audio) % 2:
                         raise ValueError("Invalid PCM16 audio")
                     buffer = io.BytesIO()
                     sf.write(buffer, np.frombuffer(audio, dtype="<i2"), 24000, format="WAV", subtype="PCM_16")
                     audio = buffer.getvalue()
+                # Native Chat media loading limits the encoded file, including
+                # the WAV header added to raw PCM or a committed input buffer.
+                if len(audio) > self._max_audio_filesize_mb * 1024**2:
+                    raise ValueError("Conversation audio exceeds maximum size")
                 content.append(
                     {
                         "type": "input_audio",
@@ -401,7 +423,10 @@ class Ming3RealtimeConnection(RealtimeConnection):
     async def _emit_audio(self, samples, common, session):
         if not samples.size:
             return False
-        self._audio_started = True
-        self._spoken_voice = self._voice_key(session)
+        if not self._audio_started:
+            # The response uses a validated session snapshot; its voice is
+            # immutable. Reference audio may be large, so fingerprint it once.
+            self._spoken_voice = self._voice_key(session)
+            self._audio_started = True
         await self.send_json({"type": "response.output_audio.delta", **common, "delta": self._pcm16_b64(samples)})
         return True

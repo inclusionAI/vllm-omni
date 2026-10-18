@@ -11,6 +11,8 @@ enable_chunked_prefill: true
 
 stages:
   - stage_id: 0
+    limit_mm_per_prompt:
+      audio: 1
     devices: "0"
     tensor_parallel_size: 1
     max_num_seqs: 1

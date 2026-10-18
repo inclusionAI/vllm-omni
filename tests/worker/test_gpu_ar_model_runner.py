@@ -671,10 +671,17 @@ def test_async_omni_output_guard_requires_safe_conditions():
     assert GPUARModelRunner._should_use_async_omni_output(runner)
 
 
-def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
+@pytest.mark.parametrize("ming3", [False, True])
+def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch, ming3):
     runner = _make_async_output_runner(engine_output_type="latent")
-    runner.model.omni_pooler_payload_include_hidden = False
-    runner._pooler_payload_include_hidden_flag = False
+    if ming3:
+        from vllm_omni.model_executor.models.ming3_audio.ming3_audio import BailingMoeV3AudioForConditionalGeneration
+
+        runner.model = BailingMoeV3AudioForConditionalGeneration
+        runner._pooler_payload_include_hidden_flag = getattr(runner.model, "omni_pooler_payload_include_hidden", True)
+    else:
+        runner.model.omni_pooler_payload_include_hidden = False
+        runner._pooler_payload_include_hidden_flag = False
 
     monkeypatch.setattr(
         GPUARModelRunner,

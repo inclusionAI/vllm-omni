@@ -189,6 +189,7 @@ class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
             model_config=self.model_config,
             is_pooling_model=self.is_pooling_model,
             speculative_config=self.speculative_config,
+            model_cache_policy=self._omni_cache_policy,
         )
         if cfg is not None:
             self._omni_prefix_cache_cfg = cfg

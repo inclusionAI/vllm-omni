@@ -84,23 +84,28 @@ class Ming3AudioProcessingInfo(BaseProcessingInfo):
         return MultiModalDataParser(target_sr=_SAMPLE_RATE, target_channels=1)
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        # The released model and processor accept one concatenated audio item.
-        return {"audio": 1}
+        # The deployment decides the item limit, including historical audio.
+        return {"audio": None}
 
     def get_mm_max_tokens_per_item(
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
     ) -> Mapping[str, int]:
-        del mm_counts
-        non_audio_prompt = f"{AUDIO_START_TOKEN}{AUDIO_END_TOKEN}{ASR_PROMPT}"
+        num_audios = max(1, mm_counts.get("audio", 0))
+        non_audio_prompt = f"{AUDIO_START_TOKEN}{AUDIO_END_TOKEN}" * num_audios + ASR_PROMPT
         prompt_tokens = len(self.get_tokenizer().encode(non_audio_prompt))
-        return {"audio": max(1, seq_len - prompt_tokens)}
+        # All items share one context. Reserving the whole sequence for each
+        # item overestimates encoder profiling memory for multi-turn histories.
+        token_budget = (seq_len - prompt_tokens) // num_audios
+        if token_budget < 1:
+            raise ValueError("Context length is too small for the configured audio item count")
+        return {"audio": token_budget}
 
 
 class Ming3AudioDummyInputsBuilder(BaseDummyInputsBuilder[Ming3AudioProcessingInfo]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
-        return get_ming3_audio_placeholder("audio", 0) if mm_counts.get("audio", 0) else ""
+        return get_ming3_audio_placeholder("audio", 0) * mm_counts.get("audio", 0)
 
     def get_dummy_mm_data(
         self,
@@ -146,23 +151,26 @@ class Ming3AudioMultiModalProcessor(OmniMultiModalProcessor[Ming3AudioProcessing
         audios = mm_data.get("audios", []) or mm_data.get("audio", [])
         if not audios:
             return BatchFeature({"input_ids": torch.tensor([prompt_ids], dtype=torch.long)})
-        if len(audios) != 1:
-            raise ValueError("Ming-3.0-audio-flash supports exactly one audio item")
-
-        audio = audios[0]
-        if isinstance(audio, tuple):
-            waveform, sample_rate = audio
-        else:
-            waveform, sample_rate = audio, _SAMPLE_RATE
-        features = self.info.get_feature_extractor()(
-            [(np.asarray(waveform), sample_rate)],
-            return_tensors="pt",
-        )
+        # The shared Ming extractor packs clips along the time dimension.
+        # Extract each item independently so vLLM can cache and replace every
+        # message placeholder separately, even for unequal or repeated clips.
+        extractor = self.info.get_feature_extractor()
+        audio_feats = []
+        audio_lengths = []
+        for audio in audios:
+            if isinstance(audio, tuple):
+                waveform, sample_rate = audio
+            else:
+                waveform, sample_rate = audio, _SAMPLE_RATE
+            features = extractor([(np.asarray(waveform), sample_rate)], return_tensors="pt")
+            audio_feats.append(features["audio_feats"].squeeze(0))
+            audio_lengths.append(features["audio_feats_lengths"].reshape(1))
         return BatchFeature(
             {
                 "input_ids": torch.tensor([prompt_ids], dtype=torch.long),
-                "audio_feats": features["audio_feats"],
-                "audio_feats_lengths": features["audio_feats_lengths"],
+                # Preserve the existing tensor layout for a single clip.
+                "audio_feats": audio_feats[0].unsqueeze(0) if len(audio_feats) == 1 else audio_feats,
+                "audio_feats_lengths": torch.stack(audio_lengths),
             }
         )
 

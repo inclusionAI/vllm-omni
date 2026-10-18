@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from vllm_omni.core.prefix_cache.interface import OmniPrefixCacheUnmatchError, PrefixCacheConfig
+from vllm_omni.core.prefix_cache.interface import ModelCachePolicy, OmniPrefixCacheUnmatchError, PrefixCacheConfig
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import InputBatch
@@ -166,17 +166,22 @@ def stage_prefix_cache_config(
     model_config: object,
     is_pooling_model: bool,
     speculative_config: object = None,
+    model_cache_policy: ModelCachePolicy = ModelCachePolicy(),
 ) -> PrefixCacheConfig | None:
     """Runner-side gate shared by the GPU and NPU model runners.
 
     Returns None when the stage does not run an omni prefix cache
-    (``enable_prefix_caching`` off, or a pooling stage that never saves).
+    (``enable_prefix_caching`` off, a pooling stage that never saves, or
+    an explicit native-KV-only model). Native-only stages leave native KV
+    cache configuration and its validation untouched.
     Otherwise refuses kv_consumer / kv_both, speculative decoding,
     sub-block matching and hybrid kv groups, then sizes the config from
     the scheduler. One place so a platform runner cannot silently skip a
     refusal the other one has.
     """
     if not getattr(cache_config, "enable_prefix_caching", False) or is_pooling_model:
+        return None
+    if model_cache_policy.native_kv_cache_only:
         return None
     check_prefix_cache_kv_transfer(kv_transfer_config)
     check_prefix_cache_token_accounting(cache_config, speculative_config)

@@ -75,6 +75,102 @@ vllm serve inclusionAI/Ming-3.0-audio-flash \
     --port 8091
 ```
 
+### Original audio in multi-turn history
+
+To retain original audio clips across turns, explicitly select the history profile:
+
+```bash
+vllm serve inclusionAI/Ming-3.0-audio-flash --omni \
+    --deploy-config ming3_audio_flash_history.yaml \
+    --served-model-name ming3-audio-flash --port 8091
+```
+
+This overlay permits up to 16 audio items per request, counted across all
+messages, while inheriting the normal Flash profile. Other profiles keep their
+existing item limits. Each clip retains its own feature length and placeholder;
+clips may have different durations or repeat an earlier recording.
+
+Send the full Chat Completions `messages` history, including earlier user
+`audio_url` content and assistant text, followed by the new user audio. For example:
+
+```json
+{
+  "model": "ming3-audio-flash",
+  "messages": [
+    {"role": "user", "content": [
+      {"type": "audio_url", "audio_url": {"url": "https://example.com/turn-1.wav"}}
+    ]},
+    {"role": "assistant", "content": "Your previous answer."},
+    {"role": "user", "content": [
+      {"type": "text", "text": "Please answer the follow-up question."},
+      {"type": "audio_url", "audio_url": {"url": "https://example.com/turn-2.wav"}}
+    ]}
+  ],
+  "modalities": ["text"],
+  "max_tokens": 256
+}
+```
+
+Replace the example URLs with accessible recordings. All audio tokens and text
+share the configured context limit. Increasing the item limit permits more clips and preprocessing
+work; all audio and text still share the context and encoder budgets. Choose a
+bound appropriate for the service. Retaining audio history does not itself enable cross-request
+KV-cache reuse. This profile keeps the base profile's prefix-cache setting.
+
+### Reusing an unchanged conversation prefix
+
+Select `ming3_audio_flash_history_cache.yaml` to enable native Thinker prefix
+caching while retaining up to 16 original audio clips. This profile enables
+chunked prefill and aligned KDA-state checkpoints; Talker prefix caching remains
+disabled. It requires the CUDA Bailing/KDA kernels supported by this recipe.
+
+Resend the complete `messages` history with identical earlier text and audio.
+The native cache reuses matching full-attention KV blocks and recurrent-state
+checkpoints, then computes the unmatched suffix. Different audio content is part
+of the native multimodal cache identity. Talker voice selection does not retain
+or replace the Thinker conversation history.
+
+Reuse is local to a worker and bounded by its cache capacity and block alignment.
+Eviction, another replica, or changed earlier messages can produce a miss; an
+unaligned tail may be recomputed. This is separate from audio-feature caching
+and does not permanently pin a conversation in GPU memory. Use Chat Completions
+usage details (`stream_options: {"include_usage": true}` for streaming) to inspect
+cached prompt tokens; start the server with `--enable-prompt-tokens-details`
+to expose them in `usage.prompt_tokens_details.cached_tokens`. A faster response
+alone does not establish a cache hit.
+
+### Optional Talker decode graphs and low-latency collection
+
+`ming3_audio_flash_llm_graph.yaml` enables a CUDA Graph for the Talker's
+single-token Qwen2 decode. Prefill remains eager; the outer Talker stage keeps
+`cudagraph_mode: NONE`. This is independent of the existing CFM graphs.
+The decode graph is disabled by default and when `enforce_eager` is selected.
+Unsupported inputs or capture failures fall back to eager execution.
+
+To combine Thinker prefix reuse with Talker decode graphs, save this overlay
+beside the packaged profiles, or use an absolute path to the base profile:
+
+```yaml
+base_config: ming3_audio_flash_history_cache.yaml
+stages:
+  - stage_id: 1
+    engine_extras:
+      hf_overrides:
+        enable_llm_cuda_graph: true
+        low_latency_streaming: false
+```
+
+Cache checkpoints and graph buffers consume GPU memory; choose cache capacity
+and context limits for the available devices. CUDA Graphs reset the Talker's
+static KV state for each request and do not provide Talker conversation reuse.
+
+`low_latency_streaming` defaults to `false` in all shipped profiles. Setting it
+to `true` in the Talker's `hf_overrides` collects the first available audio
+latent promptly, then resumes normal VAE batching. It is independent of prefix
+caching and decode graphs. BF16 VAE results can vary with chunk boundaries;
+even faster execution with this option disabled can change queue grouping.
+Do not assume bitwise-identical waveforms across different chunk partitions.
+
 ### Optional 128K and Tiny profiles
 
 Select these profiles explicitly with `--deploy-config`; adding the files does
@@ -301,6 +397,12 @@ in order, waiting for `conversation.item.created` before `response.create`:
 
 For an audio turn, send `input_audio_buffer.append` events with base64-encoded
 mono PCM16 little-endian audio at 24 kHz, then `input_audio_buffer.commit`.
+Alternatively, `conversation.item.create` accepts an `input_audio` content part
+with base64 `audio` and `format: "pcm16"` (the default) or `format: "wav"`.
+Direct audio items must be nonempty and respect the configured maximum audio
+file size. PCM is converted to WAV for Chat preprocessing; the WAV container
+overhead counts toward this limit. Leave room for it when forming a PCM buffer.
+Oversized items are rejected before entering conversation history.
 Wait for `conversation.item.created` and send `response.create` to request an
 answer. Committing input alone does not start generation.
 

@@ -139,6 +139,9 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             latent_dim=self.latent_dim,
             cfg_strength=self.cfg_strength,
             use_cuda_graphs=self._use_cuda_graphs,
+            enable_llm_cuda_graph=bool(
+                getattr(root_config, "enable_llm_cuda_graph", getattr(config, "enable_llm_cuda_graph", False))
+            ),
         )
         self.voice_presets = VoicePresetRegistry(
             talker_dir=self.talker_dir,
@@ -381,7 +384,9 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                         native_fragments=info.get("ming_text_fragments"),
                     )
 
-            job = MingStreamingJob(produce, self.audio_vae, self.device)
+            job = MingStreamingJob(
+                produce, self.audio_vae, self.device, low_latency_streaming=self.config.low_latency_streaming
+            )
             self._stream_jobs[request_id] = job
         try:
             audio, last = job.next_audio()

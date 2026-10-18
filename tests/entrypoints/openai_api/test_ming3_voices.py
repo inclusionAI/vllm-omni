@@ -233,6 +233,142 @@ async def test_realtime_audio_buffer_commit_is_a_user_turn(realtime):
     assert sr == 24000 and len(waveform) == 24000
 
 
+def audio_part(audio, fmt=None):
+    part = {"type": "input_audio", "audio": base64.b64encode(audio).decode()}
+    if fmt is not None:
+        part["format"] = fmt
+    return part
+
+
+@pytest.mark.parametrize("fmt", [None, "pcm16", "wav", "WAVEX", "RF64"])
+async def test_realtime_direct_audio_matches_buffer_commit(realtime, fmt):
+    samples = np.array([0, 100, -100, 32767], dtype="<i2")
+    audio = samples.tobytes()
+    if fmt in {"wav", "WAVEX", "RF64"}:
+        buffer = io.BytesIO()
+        sf.write(buffer, samples, 24000, format=fmt.upper(), subtype="PCM_16")
+        audio = buffer.getvalue()
+        fmt = "wav"
+    await realtime._add_item({"type": "message", "role": "user", "content": [audio_part(audio, fmt)]})
+    data = realtime._messages[-1]["content"][0]["input_audio"]["data"]
+    actual, rate = sf.read(io.BytesIO(base64.b64decode(data)), dtype="int16")
+    np.testing.assert_array_equal(actual, samples)
+    assert rate == 24000
+
+
+@pytest.mark.parametrize(
+    "part,error",
+    [
+        (audio_part(b""), "empty"),
+        (audio_part(b"", "wav"), "empty"),
+        (audio_part(b"\x00"), "PCM16"),
+        (audio_part(b"\x00\x00", "mp3"), "format"),
+        ({"type": "input_text", "text": 123}, "string"),
+    ],
+)
+async def test_realtime_direct_item_rejects_invalid_parts_atomically(realtime, part, error):
+    realtime._messages = [{"role": "user", "content": "previous"}]
+    await realtime.handle_event(
+        {
+            "type": "conversation.item.create",
+            "item": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "valid first part"}, part],
+            },
+        }
+    )
+    assert sent(realtime)[-1]["type"] == "error"
+    assert error in sent(realtime)[-1]["error"]["message"]
+    assert realtime._messages == [{"role": "user", "content": "previous"}]
+
+
+async def test_realtime_empty_wav_rejected(realtime):
+    buffer = io.BytesIO()
+    sf.write(buffer, np.empty(0, dtype="<i2"), 24000, format="WAV", subtype="PCM_16")
+    with pytest.raises(ValueError, match="empty"):
+        await realtime._add_item({"type": "message", "role": "user", "content": [audio_part(buffer.getvalue(), "wav")]})
+    assert not realtime._messages
+
+
+async def test_realtime_non_wav_container_cannot_claim_wav_format(realtime):
+    buffer = io.BytesIO()
+    sf.write(buffer, np.zeros(4, dtype="<i2"), 24000, format="FLAC")
+    with pytest.raises(ValueError, match="WAV"):
+        await realtime._add_item({"type": "message", "role": "user", "content": [audio_part(buffer.getvalue(), "wav")]})
+    assert not realtime._messages
+
+
+@pytest.mark.parametrize("fmt", [None, "wav"])
+async def test_realtime_direct_audio_size_limit(realtime, fmt):
+    realtime._max_audio_filesize_mb = 4 / 1024**2
+    with pytest.raises(ValueError, match="maximum size"):
+        await realtime._add_item({"type": "message", "role": "user", "content": [audio_part(b"\x00" * 6, fmt)]})
+    assert not realtime._messages
+
+
+@pytest.mark.parametrize("route", ["direct", "buffer"])
+@pytest.mark.parametrize("size", ["fits", "header_overflow", "full_raw_limit"])
+async def test_realtime_pcm_admission_matches_native_wav_file_limit(realtime, monkeypatch, route, size):
+    from vllm.exceptions import VLLMValidationError
+    from vllm.multimodal.media.audio import AudioMediaIO
+
+    buffer = io.BytesIO()
+    sf.write(buffer, np.zeros(2, dtype="<i2"), 24000, format="WAV", subtype="PCM_16")
+    limit = len(buffer.getvalue())  # Exact WAV boundary, including the container.
+    realtime._max_audio_filesize_mb = limit / 1024**2
+    monkeypatch.setattr(AudioMediaIO, "get_max_bytes", lambda self: limit)
+    native = AudioMediaIO(audio_backend="soundfile")
+    pcm = b"\x00" * {"fits": 4, "header_overflow": 6, "full_raw_limit": limit}[size]
+    fits = size == "fits"
+    if not fits:
+        buffer = io.BytesIO()
+        sf.write(buffer, np.frombuffer(pcm, dtype="<i2"), 24000, format="WAV", subtype="PCM_16")
+        with pytest.raises(VLLMValidationError):
+            native.load_base64("audio/wav", base64.b64encode(buffer.getvalue()).decode())
+    realtime._messages = [{"role": "user", "content": "previous"}]
+    if route == "buffer":
+        await realtime.handle_event({"type": "input_audio_buffer.append", "audio": base64.b64encode(pcm).decode()})
+        await realtime.handle_event({"type": "input_audio_buffer.commit"})
+    else:
+        await realtime.handle_event(
+            {
+                "type": "conversation.item.create",
+                "item": {"type": "message", "role": "user", "content": [audio_part(pcm)]},
+            }
+        )
+    if not fits:
+        assert sent(realtime)[-1]["type"] == "error"
+        assert "maximum size" in sent(realtime)[-1]["error"]["message"]
+        assert realtime._messages == [{"role": "user", "content": "previous"}]
+        assert not any(
+            e["type"] in {"conversation.item.created", "input_audio_buffer.committed"} for e in sent(realtime)
+        )
+        if route == "buffer":
+            assert realtime._input_audio == pcm
+    else:
+        assert sent(realtime)[-1]["type"] == (
+            "input_audio_buffer.committed" if route == "buffer" else "conversation.item.created"
+        )
+        audio = realtime._messages[-1]["content"][0]["input_audio"]
+        assert len(base64.b64decode(audio["data"])) == limit
+        waveform, rate = native.load_base64("audio/wav", audio["data"])
+        assert rate == 24000 and len(waveform) == len(pcm) // 2
+        assert not realtime._input_audio
+
+
+async def test_realtime_audio_locks_voice_once_after_first_nonempty_chunk(realtime, monkeypatch):
+    key = Mock(wraps=realtime._voice_key)
+    monkeypatch.setattr(realtime, "_voice_key", key)
+    assert not await realtime._emit_audio(np.empty(0), {}, realtime._session)
+    key.assert_not_called()
+    assert not realtime._audio_started
+    for _ in range(3):
+        assert await realtime._emit_audio(np.zeros(10), {}, realtime._session)
+    key.assert_called_once_with(realtime._session)
+    assert realtime._spoken_voice == ("reference", None)
+
+
 async def test_realtime_response_uses_selected_voice_and_emits_pcm24(realtime, store, model):
     await register_model_voice_presets(store, str(model))
     await update(realtime)

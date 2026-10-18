@@ -15,6 +15,7 @@ from tokenizers.pre_tokenizers import Whitespace
 from transformers import AutoConfig, PreTrainedTokenizerFast
 from vllm.config import VllmConfig
 from vllm.config.speech_to_text import SpeechToTextParams
+from vllm.exceptions import VLLMValidationError
 from vllm.model_executor.models.interfaces import (
     is_hybrid,
     supports_multimodal,
@@ -83,7 +84,7 @@ def tiny_model_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
             "num_attention_heads": 2,
             "num_key_value_heads": 2,
             "vocab_size": 16,
-            "max_position_embeddings": 128,
+            "max_position_embeddings": 512,
             "head_dim": 8,
             "qk_head_dim": 8,
             "qk_nope_head_dim": 4,
@@ -510,3 +511,165 @@ def test_ming3_standalone_tts_leaves_ming2_pipeline_unchanged():
     assert new_stage.model_arch == "BailingTalker2"
     assert new_stage.tokenizer_subdir == "llm"
     assert new_stage.model_path_resolver is not None
+
+
+@pytest.fixture(params=[False, True], ids=["uncached", "cached"])
+def history_processor(request, tiny_model_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from vllm.multimodal.cache import MultiModalProcessorOnlyCache
+
+    config = OmniModelConfig(
+        model=str(tiny_model_path),
+        tokenizer=str(tiny_model_path),
+        trust_remote_code=False,
+        max_model_len=512,
+        limit_mm_per_prompt={"audio": 16},
+        model_arch="BailingMoeV3AudioForConditionalGeneration",
+        model_stage="thinker",
+        hf_config_name="text_config",
+    )
+    ctx = InputProcessingContext(config, tokenizer=cached_tokenizer_from_config(config))
+    cache = MultiModalProcessorOnlyCache(config) if request.param else None
+    processor = BailingMoeV3AudioForConditionalGeneration._processor_factory.build_processor(ctx, cache=cache)
+    # Exercise the real Whisper frontend on CPU without depending on a CUDA
+    # context; model-independent transfer is the only substituted operation.
+    monkeypatch.setattr(torch.Tensor, "cuda", lambda self, *args, **kwargs: self)
+    return processor
+
+
+def _process_audio_history(processor, waveforms):
+    tokenizer = processor.info.get_tokenizer()
+    messages: list[dict[str, object]] = [{"role": "system", "content": "test"}]
+    for index in range(len(waveforms)):
+        messages.append({"role": "user", "content": [{"type": "text", "text": "test"}, {"type": "audio"}]})
+        if index + 1 < len(waveforms):
+            messages.append({"role": "assistant", "content": "test"})
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    items = processor.info.parse_mm_data({"audio": [(waveform, 16000) for waveform in waveforms]})
+    return processor(prompt, mm_items=items, hf_processor_mm_kwargs={})
+
+
+@pytest.mark.parametrize("item_count", [1, 2, 13])
+def test_audio_history_preserves_individual_features_and_placeholders(history_processor, item_count):
+    from vllm_omni.model_executor.models.common.ming.audio_lengths import ming3_audio_token_count
+    from vllm_omni.model_executor.models.ming3_audio.processing import _audio_config_args
+
+    rng = np.random.RandomState(42)
+    waveforms = [rng.uniform(-0.1, 0.1, size=1600 + 160 * index).astype(np.float32) for index in range(item_count)]
+    if item_count > 2:
+        waveforms[-1] = waveforms[0].copy()  # Duplicate items must retain both message positions.
+    output = _process_audio_history(history_processor, waveforms)
+    audio_items = output["mm_kwargs"]["audio"]
+    placeholders = output["mm_placeholders"]["audio"]
+    assert len(audio_items) == len(placeholders) == item_count
+    for index, waveform in enumerate(waveforms):
+        expected = history_processor.info.get_feature_extractor()([(waveform, 16000)], return_tensors="pt")
+        actual = audio_items[index]
+        torch.testing.assert_close(actual["audio_feats"].data, expected["audio_feats"][0])
+        assert actual["audio_feats_lengths"].data.item() == expected["audio_feats_lengths"].item()
+        count = ming3_audio_token_count(
+            expected["audio_feats_lengths"].item(), **_audio_config_args(history_processor.info.get_hf_config())
+        )
+        assert placeholders[index].length == count
+        offset = placeholders[index].offset
+        assert output["prompt_token_ids"][offset : offset + count] == [3] * count
+    # A second call covers processor-cache hits and uncached equivalence.
+    repeated = _process_audio_history(history_processor, waveforms)
+    assert repeated["prompt_token_ids"] == output["prompt_token_ids"]
+    for previous, current in zip(audio_items, repeated["mm_kwargs"]["audio"], strict=True):
+        torch.testing.assert_close(previous["audio_feats"].data, current["audio_feats"].data)
+
+
+def test_audio_history_respects_configured_limit(history_processor):
+    assert history_processor.info.get_supported_mm_limits() == {"audio": None}
+    with pytest.raises(VLLMValidationError, match="16.*audio"):
+        _process_audio_history(history_processor, [np.zeros(1600, dtype=np.float32)] * 17)
+
+
+@pytest.mark.parametrize("item_count", [1, 2, 13])
+def test_audio_history_dummy_shares_context_budget(history_processor, item_count):
+    from vllm_omni.model_executor.models.common.ming.audio_lengths import ming3_audio_token_count
+    from vllm_omni.model_executor.models.ming3_audio.processing import (
+        AUDIO_PAD_TOKEN,
+        _audio_config_args,
+    )
+
+    counts = {"audio": item_count}
+    builder = history_processor.dummy_inputs
+    text = builder.get_dummy_text(counts)
+    assert text.count(AUDIO_PAD_TOKEN) == item_count
+    data = builder.get_dummy_mm_data(128, counts)
+    total_tokens = len(history_processor.info.get_tokenizer().encode(text)) - item_count
+    for waveform in data["audio"]:
+        total_tokens += ming3_audio_token_count(
+            len(waveform) // 160, **_audio_config_args(history_processor.info.get_hf_config())
+        )
+    assert total_tokens <= 128
+
+
+@pytest.mark.parametrize("lengths", [[0], [-1], [11], [1, 2]])
+def test_audio_history_rejects_invalid_feature_lengths(lengths):
+    with pytest.raises(ValueError, match="length|frame"):
+        BailingMoeV3AudioForConditionalGeneration._normalize_audio_inputs(torch.zeros(1, 10, 80), lengths)
+
+
+def test_audio_history_profile_is_explicit_and_preserves_base_settings():
+    from vllm_omni.config.stage_config import resolve_deploy_yaml
+
+    deploy_dir = Path(__file__).resolve().parents[4] / "vllm_omni" / "deploy"
+    base = resolve_deploy_yaml(deploy_dir / "ming3_audio_flash.yaml")
+    history = resolve_deploy_yaml(deploy_dir / "ming3_audio_flash_history.yaml")
+    assert base["stages"][0]["limit_mm_per_prompt"] == {"audio": 1}
+    assert history["stages"][0]["limit_mm_per_prompt"] == {"audio": 16}
+    assert history["stages"][0]["max_model_len"] == base["stages"][0]["max_model_len"]
+    assert history["stages"][1] == base["stages"][1]
+
+
+def test_audio_history_encoder_matches_individual_clips(tiny_model):
+    features = [torch.zeros(17, 80), torch.ones(33, 80)]
+    lengths = torch.tensor([[17], [33]])
+    combined = tiny_model.embed_multimodal(audio_feats=features, audio_feats_lengths=lengths)
+    assert len(combined) == 2
+    for index, feature in enumerate(features):
+        single = tiny_model.embed_multimodal(
+            audio_feats=feature.unsqueeze(0), audio_feats_lengths=lengths[index : index + 1]
+        )
+        torch.testing.assert_close(combined[index], single[0])
+
+
+def test_audio_history_normalization_keeps_single_frame_items():
+    features, lengths = BailingMoeV3AudioForConditionalGeneration._normalize_audio_inputs(
+        [torch.zeros(1, 80), torch.zeros(3, 80)], [[1], [3]]
+    )
+    assert [feature.shape for feature in features] == [(1, 80), (3, 80)]
+    assert lengths == [1, 3]
+
+
+def test_audio_history_partial_cache_hits_preserve_reordered_items(history_processor, mocker: MockerFixture):
+    from vllm_omni.model_executor.models.common.ming.audio_lengths import ming3_audio_token_count
+    from vllm_omni.model_executor.models.ming3_audio.processing import _audio_config_args
+
+    rng = np.random.RandomState(17)
+    waveforms = [rng.uniform(-0.1, 0.1, size=length).astype(np.float32) for length in (1600, 4000, 8000)]
+    expected = [
+        history_processor.info.get_feature_extractor()([(waveform, 16000)], return_tensors="pt")
+        for waveform in waveforms
+    ]
+    frontend = mocker.spy(history_processor, "_call_hf_processor")
+    for order in [(0,), (0, 1), (1, 0, 2)]:
+        output = _process_audio_history(history_processor, [waveforms[index] for index in order])
+        audio_items = output["mm_kwargs"]["audio"]
+        placeholders = output["mm_placeholders"]["audio"]
+        assert len(audio_items) == len(placeholders) == len(order)
+        for item, placeholder, index in zip(audio_items, placeholders, order, strict=True):
+            reference = expected[index]
+            torch.testing.assert_close(item["audio_feats"].data, reference["audio_feats"][0])
+            length = reference["audio_feats_lengths"].item()
+            assert item["audio_feats_lengths"].data.item() == length
+            count = ming3_audio_token_count(length, **_audio_config_args(history_processor.info.get_hf_config()))
+            assert placeholder.length == count
+            assert output["prompt_token_ids"][placeholder.offset : placeholder.offset + count] == [3] * count
+
+    # A and then B must hit the same processor's cache while C is new, even
+    # when earlier clips change order. The uncached fixture is the control.
+    processed_counts = [len(call.args[1].get("audios", [])) for call in frontend.call_args_list]
+    assert processed_counts == ([1, 1, 1] if history_processor.cache is not None else [1, 2, 3])
