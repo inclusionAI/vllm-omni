@@ -34,6 +34,10 @@ class LingV3TTSAdapter(ARTTSAdapter):
     detect_priority = 190
     max_new_tokens_max = MAX_DECODE_STEPS
 
+    @property
+    def tts_config(self) -> dict[str, Any]:
+        return dict(getattr(self.ctx.server.engine_client.model_config.hf_config, "tts_config", {}) or {})
+
     def validate(self, request: OpenAICreateSpeechRequest) -> str | None:
         server = self.ctx.server
         error = server._apply_uploaded_speaker(request)
@@ -55,8 +59,9 @@ class LingV3TTSAdapter(ARTTSAdapter):
         if request.speaker_embedding is not None:
             return "LingV3-TTS v1 derives speaker conditioning from 'ref_audio'"
         if request.max_new_tokens is not None:
-            if request.max_new_tokens < 5:
-                return "max_new_tokens must be at least 5"
+            minimum = int(self.tts_config.get("minimum_decode_steps", 5))
+            if request.max_new_tokens < minimum:
+                return f"max_new_tokens must be at least {minimum}"
             if request.max_new_tokens > MAX_DECODE_STEPS:
                 return f"max_new_tokens cannot exceed {MAX_DECODE_STEPS}"
         return None
@@ -84,7 +89,8 @@ class LingV3TTSAdapter(ARTTSAdapter):
             reference_waveform=torch.as_tensor(samples, dtype=torch.float32).reshape(1, -1),
             reference_sample_rate=int(sample_rate),
             prompt_text=request.ref_text,
-            max_decode_steps=request.max_new_tokens,
+            max_decode_steps=request.max_new_tokens
+            or int(self.tts_config.get("maximum_decode_steps", MAX_DECODE_STEPS)),
         )
         prompt = tokens_input(prompt_token_ids=prompt_dict["prompt_token_ids"])
         prompt["prompt"] = prompt_dict["prompt"]
@@ -105,7 +111,7 @@ class LingV3TTSAdapter(ARTTSAdapter):
     ) -> list:
         updated = copy.deepcopy(sampling_params_list)
         updated[0].stop_token_ids = [AUDIO_END_TOKEN_ID]
-        latent_cap = int(request.max_new_tokens or MAX_DECODE_STEPS)
+        latent_cap = int(request.max_new_tokens or self.tts_config.get("maximum_decode_steps", MAX_DECODE_STEPS))
         updated[0].max_tokens = latent_cap + 1
         if prompt is not None:
             info = prompt.get("additional_information")

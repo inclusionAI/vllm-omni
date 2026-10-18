@@ -355,3 +355,63 @@ def test_lingv3_vectorizes_only_compatible_flow_requests():
     assert calls[0]["solver_noise"].shape == (10, 2, 1, 3)
     assert calls[0]["cfg_scale"] == 2.0
     assert not torch.equal(calls[0]["initial_noise"][0], calls[0]["initial_noise"][1])
+
+
+def test_sft_config_preserves_gate_and_sampling_defaults():
+    legacy = _config()
+    backbone = legacy.llm_config.to_dict()
+    backbone.update(kda_safe_gate=True, kda_lower_bound=-5.0)
+    config = LingV3TTSConfig(
+        llm_config=backbone,
+        audio_config=legacy.audio_config,
+        tts_config={
+            **legacy.tts_config,
+            "task_contract": "lingv3_sft_multitask_v1",
+            "sampling_temperature": 1.5,
+            "minimum_decode_steps": 13,
+            "maximum_decode_steps": 250,
+        },
+    )
+    runtime = LingV3TTSRuntimeConfig.from_hf_config(config)
+    runtime.validate()
+    assert config.llm_config.kda_safe_gate is True
+    assert config.llm_config.kda_lower_bound == -5.0
+    assert runtime.temperature == 1.5
+    assert runtime.stop_head_min_steps == 13
+    assert runtime.max_decode_steps == 250
+
+
+def test_unknown_task_contract_is_rejected():
+    with pytest.raises(ValueError, match="Unsupported LingV3 task contract"):
+        LingV3TTSConfig(tts_config={"task_contract": "unknown"})
+
+
+@pytest.mark.parametrize(
+    "tts_config,ref_text,max_tokens,error",
+    [
+        ({}, "reference", 5, None),
+        ({"conditioning_mode": "speaker_only"}, "reference", None, None),
+        ({"conditioning_mode": "speaker_only"}, None, None, None),
+        ({"minimum_decode_steps": 13}, None, 12, "at least 13"),
+        ({"minimum_decode_steps": 13}, None, 13, None),
+    ],
+)
+def test_adapter_validates_checkpoint_conditioning_and_minimum(tts_config, ref_text, max_tokens, error):
+    from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+    from vllm_omni.entrypoints.openai.tts_adapters.base import SpeechServingContext
+    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
+
+    server = SimpleNamespace(
+        engine_client=SimpleNamespace(model_config=SimpleNamespace(hf_config=SimpleNamespace(tts_config=tts_config))),
+        _apply_uploaded_speaker=lambda request: None,
+        _validate_ref_audio_format=lambda source: None,
+    )
+    adapter = LingV3TTSAdapter(SpeechServingContext(server=server))
+    request = OpenAICreateSpeechRequest(
+        input="Hello", ref_audio="data:audio/wav;base64,AA==", ref_text=ref_text, max_new_tokens=max_tokens
+    )
+    result = adapter.validate(request)
+    if error is None:
+        assert result is None
+    else:
+        assert error in result

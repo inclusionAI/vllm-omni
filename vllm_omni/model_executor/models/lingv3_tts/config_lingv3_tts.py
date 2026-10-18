@@ -60,9 +60,6 @@ class BailingMoeV3Config(PretrainedConfig):
 
     def __init__(self, **kwargs: Any) -> None:
         checkpoint_model_type = kwargs.pop("model_type", "bailing_moe_v3")
-        # NOTE: disable bounded safe gate for now, for parity
-        kwargs["kda_safe_gate"] = False
-        kwargs["kda_lower_bound"] = None
         super().__init__(**kwargs)
         self.checkpoint_model_type = checkpoint_model_type
 
@@ -81,13 +78,20 @@ class LingV3TTSConfig(PretrainedConfig):
         architectures: list[str] | None = None,
         **kwargs: Any,
     ) -> None:
+        self.tts_config = dict(tts_config or {})
+        task_contract = self.tts_config.get("task_contract")
+        if task_contract not in (None, "", "lingv3_sft_multitask_v1"):
+            raise ValueError(f"Unsupported LingV3 task contract: {task_contract!r}")
         self.llm_config = (
             llm_config if isinstance(llm_config, BailingMoeV3Config) else BailingMoeV3Config(**_plain(llm_config))
         )
+        if not task_contract:
+            # Legacy checkpoints were validated with the unbounded KDA gate.
+            self.llm_config.kda_safe_gate = False
+            self.llm_config.kda_lower_bound = None
         self.audio_config = (
             audio_config if isinstance(audio_config, AudioVAEConfig) else AudioVAEConfig(**_plain(audio_config))
         )
-        self.tts_config = dict(tts_config or {})
         self.aggregator_config = dict(aggregator_config or {})
         self.flow_config = dict(flow_config or {})
         kwargs.pop("tie_word_embeddings", None)
@@ -159,6 +163,8 @@ class LingV3TTSRuntimeConfig:
             sample_rate=int(tts.get("sample_rate", getattr(audio, "sample_rate", SAMPLE_RATE))),
             audio_frame_hop=int(audio.enc_kwargs.get("hop_size", AUDIO_FRAME_HOP)),
             speaker_embedding_dim=int(tts.get("speaker_embedding_dim", SPEAKER_EMBEDDING_DIM)),
+            temperature=float(tts.get("sampling_temperature", DEFAULT_TEMPERATURE)),
+            max_decode_steps=int(tts.get("maximum_decode_steps", MAX_DECODE_STEPS)),
             stop_head_min_steps=int(tts.get("minimum_decode_steps", MIN_DECODE_STEPS)),
             stop_head_threshold=float(tts.get("stop_threshold", STOP_THRESHOLD)),
             audio_dummy_token_id=int(tts.get("audio_patch_token_id", AUDIO_PATCH_TOKEN_ID)),
