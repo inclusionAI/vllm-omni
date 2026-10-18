@@ -3,10 +3,11 @@
 
 import asyncio
 import base64
+import copy
 import json
 import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
@@ -841,7 +842,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if self.enable_prompt_tokens_details:
                     mm_token_counts = _get_mm_token_counts(engine_prompt)
                 if hasattr(request, "sampling_params_list"):
-                    sampling_params_list = self._to_sampling_params_list(request.sampling_params_list)
+                    sampling_params_list = self._to_sampling_params_list(request.sampling_params_list, request=request)
                 else:
                     # Use standard OpenAI API parameters for comprehension stage
                     sampling_params_list = self._build_sampling_params_list_from_request(request)
@@ -1311,8 +1312,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return new_messages
 
-    def _to_sampling_params_list(self, sampling_params_list: list[dict]) -> list[Any]:
+    def _to_sampling_params_list(
+        self, sampling_params_list: list[dict], request: ChatCompletionRequest | None = None
+    ) -> list[Any]:
         """Convert request dicts to stage-typed sampling params objects.
+
+        Partial LLM dictionaries inherit deploy defaults, then explicit top-level
+        request parameters on the comprehension stage. Explicit stage fields win.
 
         For diffusion stages, build ``OmniDiffusionSamplingParams`` so
         downstream ``StageDiffusionClient._sampling_params_to_dict`` (which
@@ -1325,10 +1331,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         default_params_list = list(getattr(self.engine_client, "default_sampling_params_list", []) or [])
         final_sampling_params_list: list[Any] = []
         for idx, sampling_params in enumerate(sampling_params_list):
-            stage_type = get_stage_type(stage_configs[idx]) if idx < len(stage_configs) else "llm"
+            stage_config = stage_configs[idx] if idx < len(stage_configs) else None
+            stage_type = get_stage_type(stage_config)
             target_cls = OmniDiffusionSamplingParams if stage_type == "diffusion" else SamplingParams
             if isinstance(sampling_params, dict):
-                final_sampling_params_list.append(target_cls(**sampling_params))
+                if target_cls is SamplingParams:
+                    default = default_params_list[idx] if idx < len(default_params_list) else SamplingParams()
+                    final_sampling_params_list.append(
+                        self._merge_llm_sampling_params(default, stage_config, sampling_params, request)
+                    )
+                else:
+                    final_sampling_params_list.append(target_cls(**sampling_params))
             elif isinstance(sampling_params, target_cls):
                 final_sampling_params_list.append(sampling_params)
             elif isinstance(sampling_params, SamplingParams | OmniDiffusionSamplingParams):
@@ -1343,15 +1356,69 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             else:
                 raise ValueError(f"Invalid sampling params: {sampling_params}")
         for idx in range(len(final_sampling_params_list), len(stage_configs)):
-            if idx < len(default_params_list):
+            stage_config = stage_configs[idx]
+            is_comprehension = (
+                stage_config.get("is_comprehension", False)
+                if isinstance(stage_config, Mapping)
+                else getattr(stage_config, "is_comprehension", False)
+            )
+            if request is not None and is_comprehension and get_stage_type(stage_config) != "diffusion":
+                default = default_params_list[idx] if idx < len(default_params_list) else SamplingParams()
+                final_sampling_params_list.append(self._merge_llm_sampling_params(default, stage_config, {}, request))
+            elif idx < len(default_params_list):
                 final_sampling_params_list.append(clone_sampling_params(default_params_list[idx]))
             else:
                 final_sampling_params_list.append(SamplingParams())
         return final_sampling_params_list
 
+    def _merge_llm_sampling_params(
+        self,
+        default_params: SamplingParams | dict[str, Any],
+        stage_config: Any,
+        overrides: dict[str, Any],
+        request: ChatCompletionRequest | None,
+    ) -> SamplingParams:
+        """Merge raw configuration before constructing normalized runtime params."""
+        model_config = getattr(stage_config, "model_config", stage_config)
+        if isinstance(model_config, Mapping):
+            raw_defaults = model_config.get("default_sampling_params", default_params)
+        else:
+            raw_defaults = getattr(model_config, "default_sampling_params", default_params)
+        if raw_defaults is None:
+            merged = {}
+        elif isinstance(raw_defaults, Mapping):
+            merged = dict(raw_defaults)
+        elif isinstance(default_params, dict):
+            merged = dict(default_params)
+        else:
+            # Compatibility for clients without raw stage configuration. Keep
+            # their runtime policies; explicit and inferred values are ambiguous.
+            merged = {
+                name: getattr(default_params, name)
+                for name in SamplingParams.__struct_fields__
+                if not name.startswith("_") and name != "output_text_buffer_length"
+            }
+        is_comprehension = (
+            stage_config.get("is_comprehension", False)
+            if isinstance(stage_config, Mapping)
+            else getattr(stage_config, "is_comprehension", False)
+        )
+        if request is not None and is_comprehension:
+            merged.update(self._request_sampling_overrides(request))
+        extra_args = merged.get("extra_args")
+        merged.update(overrides)
+        if isinstance(extra_args, dict) and isinstance(overrides.get("extra_args"), dict):
+            merged["extra_args"] = {**extra_args, **overrides["extra_args"]}
+        # Constructors derive cache/stop/greedy state from the final values.
+        # Nested dictionaries must never alias deploy defaults or request data.
+        return SamplingParams(**copy.deepcopy(merged))
+
     def _get_comprehension_stage_index(self) -> int:
         for idx, stage in enumerate(self.engine_client.stage_configs):
-            if stage.is_comprehension:
+            is_comprehension = (
+                stage.get("is_comprehension", False) if isinstance(stage, Mapping) else stage.is_comprehension
+            )
+            if is_comprehension:
                 return idx
         raise ValueError("No comprehension stage (is_comprehension=True) found in stage configs")
 
@@ -1383,7 +1450,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         Starts with YAML defaults and only overrides fields that the user
         explicitly provided (non-None values) in the request.
 
-        max_tokens is NOT computed dynamically — it uses the deploy YAML default.
+        max_tokens uses the deploy YAML default unless explicitly overridden.
 
         Args:
             default_params: Default SamplingParams from the resolved pipeline and deploy configuration.
@@ -1393,12 +1460,20 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             New SamplingParams with YAML defaults overridden by request values.
         """
         params = default_params.clone()
+        for field_name, value in self._request_sampling_overrides(request).items():
+            setattr(params, field_name, value)
+        return params
+
+    def _request_sampling_overrides(self, request: ChatCompletionRequest) -> dict[str, Any]:
+        """Select explicit request values without introducing protocol defaults."""
+        overrides: dict[str, Any] = {}
 
         # Only apply fields explicitly provided by user, not protocol defaults.
         # Pydantic v2 uses `model_fields_set`; keep v1 fallback for compatibility.
-        explicit_fields = getattr(request, "model_fields_set", None)
-        if explicit_fields is None:
-            explicit_fields = getattr(request, "__fields_set__", set())
+        fields_set = getattr(request, "model_fields_set", None)
+        if fields_set is None:
+            fields_set = getattr(request, "__fields_set__", None)
+        explicit_fields: set[str] = set(fields_set or ())
 
         for field_name in self._OPENAI_SAMPLING_FIELDS:
             if field_name not in explicit_fields:
@@ -1406,9 +1481,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             value = getattr(request, field_name, None)
             if (value is not None and not isinstance(value, list)) or (isinstance(value, list) and len(value) > 0):
-                setattr(params, field_name, value)
+                overrides[field_name] = value
 
-        return params
+        if "max_completion_tokens" in explicit_fields and request.max_completion_tokens is not None:
+            overrides["max_tokens"] = request.max_completion_tokens
+
+        return overrides
 
     @staticmethod
     def _set_if_supported(obj: Any, **kwargs: Any) -> None:
@@ -1489,14 +1567,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         sampling_params_list = []
         for idx, default_params in enumerate(default_params_list):
-            if isinstance(default_params, dict):
-                default_params = SamplingParams(**default_params)
             if idx == comprehension_idx:
-                params = self._apply_request_overrides(default_params, request)
+                params = self._merge_llm_sampling_params(
+                    default_params, self.engine_client.stage_configs[idx], {}, request
+                )
                 sampling_params_list.append(params)
             else:
                 # For other stages, clone default params
-                sampling_params_list.append(default_params.clone())
+                sampling_params_list.append(
+                    SamplingParams(**default_params) if isinstance(default_params, dict) else default_params.clone()
+                )
 
         return sampling_params_list
 
