@@ -29,6 +29,7 @@ def job():
     value.stream_state = (None, None, None)
     value.finished = False
     value._has_audio_output = False
+    value._has_latents = False
     value.low_latency_streaming = True
     value.vae = Mock()
     value.vae.decode.side_effect = lambda latent, **kwargs: (latent, (1, 2, 3), "cache")
@@ -129,6 +130,52 @@ def test_empty_queue_returns_empty_until_producer_finishes(job):
     job.done.set()
     with pytest.raises(RuntimeError, match="without a final latent"):
         job.next_audio()
+
+
+@pytest.mark.parametrize("low_latency", [False, True])
+def test_explicit_empty_completion_does_not_decode_a_latent(job, low_latency):
+    job.low_latency_streaming = low_latency
+    job.queue.put((None, True))
+    job.done.set()
+
+    audio, last = job.next_audio()
+
+    assert audio.shape == (1, 1, 0)
+    assert last and job.finished
+    job.vae.decode.assert_not_called()
+
+
+@pytest.mark.parametrize("previous_output", [None, 0, 1])
+def test_empty_completion_cannot_replace_a_missing_final_latent(job, previous_output):
+    if previous_output is not None:
+        job.vae.decode.return_value = (torch.ones(1, 1, previous_output), (None, None, None), None)
+        job.vae.decode.side_effect = None
+        job.queue.put((torch.ones(1, 1, 1), False))
+        job.next_audio()
+    job.queue.put((None, previous_output is not None))
+    job.done.set()
+
+    with pytest.raises(RuntimeError, match="empty completion"):
+        job.next_audio()
+
+
+@pytest.mark.parametrize("interrupt", ["cancel", "error"])
+def test_empty_completion_does_not_hide_concurrent_interrupt(job, monkeypatch, interrupt):
+    job.queue.put((None, True))
+    get = job.queue.get_nowait
+
+    def get_and_interrupt():
+        value = get()
+        if interrupt == "cancel":
+            job.cancelled.set()
+        else:
+            job.error = ValueError("producer failed")
+        return value
+
+    monkeypatch.setattr(job.queue, "get_nowait", get_and_interrupt)
+    with pytest.raises(_CancelledError if interrupt == "cancel" else ValueError):
+        job.next_audio()
+    job.vae.decode.assert_not_called()
 
 
 def test_producer_error_is_propagated_without_decoding(job):

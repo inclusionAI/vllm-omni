@@ -18,6 +18,8 @@ class MingStreamingJob:
 
     The producer marks the final latent, so even a one-chunk utterance can
     flush the VAE without submitting an empty latent or duplicating a frame.
+    A normalized-away fragment publishes (None, True) as an empty completion;
+    this control event never enters the VAE and cannot follow audio latents.
     By default, wait for the polling interval and then drain ready latents.
     With low_latency_streaming, decode the first audio as soon as latents are
     ready, then coalesce within the polling budget and flush final latents
@@ -38,6 +40,7 @@ class MingStreamingJob:
         self.stream_state = (None, None, None)
         self.finished = False
         self._has_audio_output = False
+        self._has_latents = False
         # The caller may have cloned input tensors on its current stream.
         ready = torch.cuda.Event()
         ready.record(torch.cuda.current_stream(device))
@@ -115,13 +118,19 @@ class MingStreamingJob:
                         latent, last = self.queue.get(timeout=remaining)
                     except Empty:
                         continue
+            if latent is None:
+                if not last or parts or self._has_latents:
+                    raise RuntimeError("Ming empty completion must precede all audio latents")
+                break
             parts.append(latent)
         if self.cancelled.is_set():
             raise _CancelledError()
         if self.error is not None:
             raise self.error
         if not parts:
-            return torch.empty(1, 1, 0, device=self.device), False
+            self.finished = last
+            return torch.empty(1, 1, 0, device=self.device), last
+        self._has_latents = True
         audio, self.stream_state, self.past_key_values = self.vae.decode(
             torch.cat(parts, dim=1),
             past_key_values=self.past_key_values,

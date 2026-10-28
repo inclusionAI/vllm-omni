@@ -580,6 +580,10 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             ]
             text_segments = [segment for segment in text_segments if segment.strip()]
             if not text_segments:
+                if on_latent is not None:
+                    # Normalization can remove an entire fragment. Complete
+                    # the stream explicitly without inventing an audio latent.
+                    on_latent(None, True)
                 return []
         else:
             if text and params.scrub_markup:

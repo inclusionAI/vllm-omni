@@ -167,3 +167,66 @@ def test_native_fragments_are_normalized_once_without_receiver_resegmentation(mo
     )
     model.audio_generator.generate_latents.assert_not_called()
     model.model.get_input_embeddings.assert_not_called()
+
+
+@pytest.mark.parametrize("fragments", [[], [""], ["，，，，，，，，，，，，，"]])
+def test_empty_native_fragments_complete_stream_without_generating_audio(mocker, fragments):
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.models.ming_flash_omni import ming_flash_omni_talker as talker
+
+    model = mocker.Mock()
+    model._project_spk_emb.return_value = None
+    mocker.patch.object(talker, "normalize_native_fragment", return_value="")
+    params = resolve_generation_params({}, MingFlashOmniTalkerConfig())
+    voice = SimpleNamespace(spk_emb=None, already_projected=False)
+    published = []
+
+    result = talker.MingFlashOmniTalkerForConditionalGeneration._generate_latents(
+        model,
+        input_ids=torch.tensor([0]),
+        inputs_embeds=None,
+        text="".join(fragments),
+        params=params,
+        voice=voice,
+        native_fragments=fragments,
+        on_latent=lambda latent, last: published.append((latent, last)),
+    )
+
+    assert result == []
+    assert published == [(None, True)]
+    model.audio_generator.generate_latents.assert_not_called()
+    model.model.get_input_embeddings.assert_not_called()
+
+
+def test_empty_stream_cleanup_allows_the_next_request(mocker):
+    from types import MethodType, SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.models.ming_flash_omni import ming_flash_omni_talker as talker
+
+    cls = talker.MingFlashOmniTalkerForConditionalGeneration
+    empty_job = mocker.Mock()
+    empty_job.next_audio.return_value = (torch.empty(1, 1, 0), True)
+    model = SimpleNamespace(
+        _stream_jobs={"empty": empty_job},
+        audio_vae=SimpleNamespace(config=SimpleNamespace(sample_rate=24000)),
+        config=MingFlashOmniTalkerConfig(),
+        device=torch.device("cpu"),
+    )
+    model.on_requests_finished = MethodType(cls.on_requests_finished, model)
+    empty_output = cls._stream_forward(model, "empty", None, None, {}, SimpleNamespace(seed=None))
+    assert empty_output.multimodal_outputs["audio"].numel() == 0
+    assert not cls.get_pending_generation_request_ids(model)
+    empty_job.close.assert_called_once()
+
+    next_job = mocker.Mock()
+    next_job.next_audio.return_value = (torch.ones(1, 1, 4), True)
+    mocker.patch.object(talker, "MingStreamingJob", return_value=next_job)
+    next_output = cls._stream_forward(model, "next", None, None, {}, SimpleNamespace(seed=None))
+    assert next_output.multimodal_outputs["audio"].numel() == 4
+    assert not cls.get_pending_generation_request_ids(model)
+    next_job.close.assert_called_once()
