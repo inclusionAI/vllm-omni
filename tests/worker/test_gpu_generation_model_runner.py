@@ -115,6 +115,8 @@ def _make_guard_runner():
     # `_prepare_inputs`, i.e. fails the way the reported crash does.
     runner = object.__new__(GPUGenerationModelRunner)
     runner.execute_model_state = None
+    runner.kv_connector_output = None
+    runner.use_async_scheduling = False
     runner.routed_experts_initialized = False
     runner.speculative_config = None
     runner.model_config = SimpleNamespace(async_chunk=False)
@@ -132,6 +134,50 @@ def _make_guard_runner():
     runner.synchronize_input_prep = contextlib.nullcontext
     runner.attach_omni_connector_output = lambda result: result
     return runner
+
+
+def test_failed_execute_returns_none_from_sampling(monkeypatch):
+    """EngineCore reads the execute future's exception only for a None result."""
+    monkeypatch.setattr(gen_runner_module, "has_ec_transfer", lambda: False)
+    monkeypatch.setattr(gen_runner_module, "has_kv_transfer_group", lambda: False)
+    runner = _make_guard_runner()
+    runner.kv_connector_output = None
+    runner.use_async_scheduling = False
+
+    def fail(_output):
+        raise RuntimeError("generation failed")
+
+    runner._update_states = fail
+    with pytest.raises(RuntimeError, match="generation failed"):
+        GPUGenerationModelRunner.execute_model(runner, _StubSchedulerOutput(1))
+
+    attach_output = runner.attach_omni_connector_output
+    runner.attach_omni_connector_output = lambda _output: pytest.fail("Must not wrap a failed execute result")
+    assert GPUGenerationModelRunner.sample_tokens(runner) is None
+    runner.attach_omni_connector_output = attach_output
+
+    # A later successful zero-token call must not inherit the failure marker.
+    runner._update_states = lambda _output: None
+    GPUGenerationModelRunner.execute_model(runner, _StubSchedulerOutput(0))
+    output = GPUGenerationModelRunner.sample_tokens(runner)
+    assert output is not None and output.req_id_to_index == {}
+
+
+@pytest.mark.parametrize("async_scheduling, last_rank", [(False, True), (True, True), (True, False)])
+def test_sampling_without_execution_state_preserves_connector_and_pp(monkeypatch, async_scheduling, last_rank):
+    runner = _make_guard_runner()
+    connector_output = object()
+    runner.kv_connector_output = connector_output
+    runner.use_async_scheduling = async_scheduling
+    received = []
+    runner._pp_receive_prev_sampled_token_ids_to_input_batch = lambda: received.append(True)
+    monkeypatch.setattr(gen_runner_module, "get_pp_group", lambda: SimpleNamespace(is_last_rank=last_rank))
+
+    output = GPUGenerationModelRunner.sample_tokens(runner)
+
+    assert output.kv_connector_output is connector_output
+    assert runner.kv_connector_output is None
+    assert received == ([True] if async_scheduling and not last_rank else [])
 
 
 @pytest.mark.parametrize("total", [-1, -512, 0])
@@ -316,5 +362,6 @@ def test_exact_shape_models_receive_unpadded_input_ids(monkeypatch, exact_shape,
 
     assert seen["input_ids"].numel() == expected_len
     assert seen["counts"] == [3]
+    assert GPUGenerationModelRunner.sample_tokens(runner) is None
     if exact_shape:
         assert sum(seen["counts"]) == seen["input_ids"].numel()

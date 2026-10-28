@@ -99,7 +99,19 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         self,
         scheduler_output: SchedulerOutput,
         intermediate_tensors: IntermediateTensors | None = None,
-    ) -> OmniModelRunnerOutput | IntermediateTensors:
+    ) -> OmniModelRunnerOutput | IntermediateTensors | None:
+        self._execute_model_failed = False
+        try:
+            return self._execute_model_impl(scheduler_output, intermediate_tensors)
+        except Exception:
+            self._execute_model_failed = True
+            raise
+
+    def _execute_model_impl(
+        self,
+        scheduler_output: SchedulerOutput,
+        intermediate_tensors: IntermediateTensors | None = None,
+    ) -> OmniModelRunnerOutput | IntermediateTensors | None:
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
@@ -376,7 +388,12 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
     def sample_tokens(
         self,
         grammar_output: GrammarOutput | None = None,
-    ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+    ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        if getattr(self, "_execute_model_failed", False):
+            # EngineCore uses None to retrieve the execute future's original
+            # exception. Connector wrapping would turn this into an empty
+            # request mapping and cause an unrelated scheduler KeyError.
+            return None
         # NOTE: Even though the model is non-autoregressive, we still need
         # this function to match the interface of the engine core.
         # In this case, this function
