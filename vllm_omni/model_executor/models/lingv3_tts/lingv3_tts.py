@@ -27,7 +27,6 @@ from vllm_omni.model_executor.models.ming_tts.audio_prep import (
 from vllm_omni.model_executor.models.ming_tts.ming_tts import (
     _ModelSampleAdapter,
 )
-from vllm_omni.model_executor.models.ming_tts.prompt_encoder import _resolve_prompt_latents
 
 from .config_lingv3_tts import LingV3TTSRuntimeConfig, get_lingv3_backbone_config
 from .constants import (
@@ -42,6 +41,7 @@ from .constants import (
     KEY_STOP_REASON,
     KEY_TEMPERATURE,
 )
+from .prompt_encoder import resolve_prompt_latents
 from .speaker_extractor import resolve_speaker_embeddings
 from .weight_accounting import validate_lingv3_checkpoint_keys
 
@@ -119,6 +119,11 @@ class LingV3TTSForConditionalGeneration(
     def forward(self, *args: Any, **kwargs: Any):
         return self.model(*args, **kwargs)
 
+    def configure_backbone_cudagraph(self, vllm_config: VllmConfig, graph_wrapper_cls) -> None:
+        if self.model_stage != "llm":
+            raise ValueError("LingV3 full CUDA graphs are supported only for the LLM backbone")
+        self.model.configure_backbone_cudagraph(vllm_config, graph_wrapper_cls)
+
     def compute_logits(self, hidden_states, sampling_metadata=None):
         return self.model.compute_logits(hidden_states, sampling_metadata=sampling_metadata)
 
@@ -177,11 +182,7 @@ class LingV3TTSForConditionalGeneration(
         if info.get("prompt_waveform") is not None:
             prompt_generator = self.model._get_request_generator(info, input_embeds.device)
         prompt_latents = (
-            None
-            if mute_speaker or no_speaker_slot
-            else _resolve_prompt_latents(
-                self, info, generator=prompt_generator, posterior_parameterization="softplus_scale"
-            )
+            None if mute_speaker or no_speaker_slot else resolve_prompt_latents(self, info, generator=prompt_generator)
         )
         history = _initial_history(
             prompt_latents["frames"] if prompt_latents is not None else None,

@@ -58,6 +58,7 @@ from vllm_omni.entrypoints.openai.tts_adapters import (
     OutputPolicy,
     SpeechServingContext,
     TTSGenerationError,
+    TTSModelAdapter,
     all_tts_stage_keys,
     detect_tts_model_type,
     resolve_adapter,
@@ -106,8 +107,6 @@ def _stage_speech_metadata(stage: Any) -> tuple[str | None, str | None, str | No
 # payloads and must fail the request, never serialize as a successful empty
 # WAV. Covers both the TTS ("audex") and TTA ("audex_tta") pipelines.
 _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES = frozenset({"audex", "audex_tta"})
-_REF_AUDIO_MIN_DURATION = 1.0  # seconds
-_REF_AUDIO_MAX_DURATION = 30.0  # seconds
 _REF_AUDIO_METADATA_FETCH_ATTEMPTS = 3
 _REMOTE_REF_AUDIO_SCHEMES = frozenset({"http", "https", "data"})
 _REF_AUDIO_RESOLVE_CACHE_MAX_ENTRIES = 256
@@ -906,17 +905,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 wav_np, sr = sf.read(io.BytesIO(content))
             except Exception as e:
                 raise ValueError(f"Could not decode audio file: {e}")
-            duration = len(wav_np) / sr if sr > 0 else 0.0
-            if duration < _REF_AUDIO_MIN_DURATION:
-                raise ValueError(
-                    f"Reference audio too short ({duration:.1f}s). "
-                    f"At least {_REF_AUDIO_MIN_DURATION:.0f}s of clear speech is required."
-                )
-            if duration > _REF_AUDIO_MAX_DURATION:
-                raise ValueError(
-                    f"Reference audio too long ({duration:.1f}s). "
-                    f"Maximum {_REF_AUDIO_MAX_DURATION:.0f}s supported — use a shorter clip."
-                )
+            self._validate_ref_audio_duration(wav_np, sr)
 
             speaker_data: dict[str, Any] = {
                 "name": name,
@@ -1222,22 +1211,30 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             allowed_local_media_path,
         )
 
+    def _validate_ref_audio_duration(self, wav_np: np.ndarray, sr: int) -> float:
+        if sr <= 0:
+            raise ValueError("Reference audio sample rate must be positive")
+        if len(wav_np) == 0:
+            raise ValueError("Reference audio must not be empty")
+        duration = len(wav_np) / sr
+        adapter_cls = resolve_adapter(self._tts_model_type) or TTSModelAdapter
+        minimum, maximum = adapter_cls.ref_audio_duration_bounds
+        if minimum is not None and duration < minimum:
+            raise ValueError(
+                f"Reference audio too short ({duration:.1f}s). At least {minimum:.0f}s of clear speech is required."
+            )
+        if maximum is not None and duration > maximum:
+            raise ValueError(
+                f"Reference audio too long ({duration:.1f}s). Maximum {maximum:.0f}s supported — use a shorter clip."
+            )
+        return duration
+
     def _finalize_fetched_ref_audio(self, wav_np: np.ndarray, sr: int) -> tuple[list[float], int, str, float]:
         wav_np = np.asarray(wav_np, dtype=np.float32)
         if wav_np.ndim > 1:
             wav_np = np.mean(wav_np, axis=-1)
         sr = int(sr)
-        duration = len(wav_np) / sr if sr > 0 else 0.0
-        if duration < _REF_AUDIO_MIN_DURATION:
-            raise ValueError(
-                f"Reference audio too short ({duration:.1f}s). "
-                f"At least {_REF_AUDIO_MIN_DURATION:.0f}s of clear speech is required."
-            )
-        if duration > _REF_AUDIO_MAX_DURATION:
-            raise ValueError(
-                f"Reference audio too long ({duration:.1f}s). "
-                f"Maximum {_REF_AUDIO_MAX_DURATION:.0f}s supported — use a shorter clip."
-            )
+        duration = self._validate_ref_audio_duration(wav_np, sr)
         artifact_key = self._make_ref_audio_artifact_cache_key(wav_np, sr)
         return wav_np.tolist(), sr, artifact_key, duration
 

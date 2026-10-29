@@ -42,6 +42,9 @@ class LingV3TTSAdapter(ARTTSAdapter):
     arch_identifies_entry_stage = True
     detect_priority = 190
     max_new_tokens_max = MAX_DECODE_STEPS
+    # Native LingV3 accepts nonempty references without fixed second limits.
+    # AudioVAE block alignment remains in the model's reference preprocessing.
+    ref_audio_duration_bounds = (None, None)
 
     @property
     def tts_config(self) -> dict[str, Any]:
@@ -109,12 +112,11 @@ class LingV3TTSAdapter(ARTTSAdapter):
             self._instruction(request.instructions)
         except ValueError as error:
             return str(error)
-        for key in (KEY_CFG, "temperature"):
-            value = (request.extra_params or {}).get(key)
-            if value is not None and (
-                isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0
-            ):
-                return f"LingV3-TTS {key} must be a finite non-negative number"
+        cfg = (request.extra_params or {}).get(KEY_CFG)
+        if cfg is not None and (
+            isinstance(cfg, bool) or not isinstance(cfg, (int, float)) or not math.isfinite(cfg) or cfg < 0
+        ):
+            return "LingV3-TTS lingv3_cfg must be a finite non-negative number"
         if request.speaker_embedding is not None:
             return "LingV3-TTS v1 derives speaker conditioning from 'ref_audio'"
         if request.max_new_tokens is not None:
@@ -260,7 +262,7 @@ class LingV3TTSAdapter(ARTTSAdapter):
                 cfg = (request.extra_params or {}).get(KEY_CFG)
                 if cfg is not None:
                     info[KEY_CFG] = float(cfg)
-                temperature = (request.extra_params or {}).get("temperature")
+                temperature = getattr(updated[0], "temperature", None)
                 if temperature is not None:
                     info[KEY_TEMPERATURE] = float(temperature)
                 if request_id is not None:

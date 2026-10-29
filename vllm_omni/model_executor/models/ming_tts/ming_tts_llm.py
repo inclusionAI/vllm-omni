@@ -135,6 +135,9 @@ class MingLLMModel(nn.Module):
     def project_speaker_embedding(self, spk_emb: torch.Tensor) -> torch.Tensor:
         return self.spk_head(spk_emb)
 
+    def _forward_backbone(self, input_ids, positions, intermediate_tensors, inputs_embeds):
+        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -160,7 +163,7 @@ class MingLLMModel(nn.Module):
         # Positional call: Qwen2Model names the 2nd arg ``positions`` while
         # BailingMoeModel names it ``position_ids`` — both share the signature
         # (input_ids, positions, intermediate_tensors, inputs_embeds).
-        backbone_out = self.model(
+        backbone_out = self._forward_backbone(
             input_ids,
             positions,
             intermediate_tensors,

@@ -215,6 +215,9 @@ class TTSModelAdapter(ABC):
     #: Target sample rates validated for this adapter's output path. An empty
     #: set means that the adapter does not expose per-request resampling.
     supported_output_sample_rates: ClassVar[frozenset[int]] = frozenset()
+    #: Reference audio duration bounds in seconds. ``None`` disables that bound.
+    #: Models may override these to match their native conditioning contract.
+    ref_audio_duration_bounds: ClassVar[tuple[float | None, float | None]] = (1.0, 30.0)
 
     max_new_tokens_min = 1
 

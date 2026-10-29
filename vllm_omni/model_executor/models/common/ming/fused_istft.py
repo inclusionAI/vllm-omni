@@ -172,6 +172,9 @@ def fused_istft(
         block_size=256,
         enable_fp_fusion=False,
     )
-    if not (envelope > 1e-11).all():
+    if torch.cuda.is_current_stream_capturing():
+        # Keep validation in the graph without reading a GPU scalar on CPU.
+        torch._assert_async((envelope > 1e-11).all(), "ISTFT window envelope underflowed; invalid overlap-add state.")
+    elif not (envelope > 1e-11).all():
         raise RuntimeError("ISTFT window envelope underflowed; invalid overlap-add state.")
     return output, next_audio, next_window

@@ -9,7 +9,7 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.model_executor.models.bailing_moe_v3 import BailingMoeV3ForCausalLM
 from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid, SupportsPP
 from vllm.model_executor.models.utils import AutoWeightsLoader, maybe_prefix
@@ -106,6 +106,17 @@ class LingV3TTSLLMModel(MingLLMModel, HasInnerState, IsHybrid, SupportsPP):
         self._last_text_mode = False
         self._init_cfm_graph_state("LINGV3_CFM_CUDAGRAPH")
         self._request_generators: dict[str, torch.Generator] = {}
+        # Keep self.model registered for weight loading.
+        self._backbone_cudagraph = None
+
+    def configure_backbone_cudagraph(self, vllm_config: VllmConfig, graph_wrapper_cls) -> None:
+        if self._backbone_cudagraph is not None:
+            raise RuntimeError("LingV3 backbone CUDA graph wrapper is already configured")
+        self._backbone_cudagraph = graph_wrapper_cls(self.model, vllm_config, runtime_mode=CUDAGraphMode.FULL)
+
+    def _forward_backbone(self, input_ids, positions, intermediate_tensors, inputs_embeds):
+        backbone = self._backbone_cudagraph if self._backbone_cudagraph is not None else self.model
+        return backbone(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def make_empty_intermediate_tensors(self, *args: Any, **kwargs: Any):
         return self.model.make_empty_intermediate_tensors(*args, **kwargs)

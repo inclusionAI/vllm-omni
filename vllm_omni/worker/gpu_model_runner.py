@@ -42,6 +42,7 @@ from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
+    from vllm.compilation.cuda_graph import CUDAGraphWrapper
     from vllm.v1.core.sched.output import SchedulerOutput
     from vllm.v1.outputs import RoutedExpertsLists
 else:
@@ -185,6 +186,7 @@ class OmniGPUModelRunner(GPUModelRunner):
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
+        self._configure_model_cudagraph_scope()
         model = getattr(self, "model", None)
         override_fn = None
         if bool(getattr(model, "supports_sampled_token_ids_cpu_override", False)):
@@ -197,6 +199,24 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._init_talker_mtp()
         self._prewarm_attention_capture_workspaces()
         self._report_model_local_kv()
+
+    def _configure_model_cudagraph_scope(self) -> None:
+        mode = self.compilation_config.cudagraph_mode
+        if mode is None or not mode.has_full_cudagraphs():
+            return
+        model = getattr(self, "model", None)
+        configure = getattr(model, "configure_backbone_cudagraph", None)
+        if not callable(configure):
+            return
+        graph_wrapper_cls = current_omni_platform.get_graph_wrapper_cls()
+        outer_wrapper = cast("CUDAGraphWrapper", model)
+        if not isinstance(model, graph_wrapper_cls) or outer_wrapper.runtime_mode != CUDAGraphMode.FULL:
+            raise RuntimeError("Backbone-only CUDA graphs require the standard FULL graph wrapper")
+        if outer_wrapper.concrete_cudagraph_entries:
+            raise RuntimeError("CUDA graph scope must be configured before graph capture")
+        configure(self.vllm_config, graph_wrapper_cls)
+        self.model = outer_wrapper.unwrap()
+        logger.info("FULL CUDA graph capture delegated to model backbone; outer model runs each step.")
 
     def _report_model_local_kv(self) -> None:
         """Log attention KV this model holds outside the paged manager.

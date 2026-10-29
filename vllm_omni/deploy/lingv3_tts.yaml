@@ -10,7 +10,7 @@ connectors:
     name: SharedMemoryConnector
     extra:
       latent_chunk_size: 25
-      initial_latent_chunk_size: 4
+      initial_latent_chunk_size: 2
       latent_left_context: 0
 
 stages:
@@ -21,11 +21,12 @@ stages:
     enable_prefix_caching: false
     async_scheduling: false
     compilation_config:
-      cudagraph_mode: PIECEWISE
-      cudagraph_capture_sizes: [1, 2, 4, 8, 16]
+      # FULL covers only the backbone; request state stays outside replay.
+      cudagraph_mode: FULL_AND_PIECEWISE
+      cudagraph_capture_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 192, 256]
       cudagraph_num_of_warmups: 1
-    max_num_batched_tokens: 8192
-    max_model_len: 8192
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
     devices: "0"
     output_connectors:
       to_stage_1: connector_of_shared_memory
@@ -33,7 +34,7 @@ stages:
       temperature: 0.0
       top_p: 1.0
       top_k: -1
-      max_tokens: 801
+      max_tokens: 251
       detokenize: true
 
   - stage_id: 1
@@ -43,8 +44,8 @@ stages:
     enforce_eager: true
     enable_prefix_caching: false
     async_scheduling: false
-    max_num_batched_tokens: 8192
-    max_model_len: 8192
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
     devices: "0"
     input_connectors:
       from_stage_0: connector_of_shared_memory

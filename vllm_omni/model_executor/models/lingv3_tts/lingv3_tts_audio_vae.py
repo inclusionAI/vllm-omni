@@ -18,6 +18,7 @@ from vllm_omni.model_executor.models.ming_tts.ming_tts_audio_vae import (
 )
 
 from .config_lingv3_tts import LingV3TTSRuntimeConfig
+from .vae_cudagraph import FirstChunkVAEGraph
 
 
 class LingV3TTSAudioVAEModel(MingAudioVAEModel):
@@ -41,6 +42,29 @@ class LingV3TTSAudioVAEModel(MingAudioVAEModel):
         self._patch_totals: dict[str, int] = {}
         self._sample_totals: dict[str, int] = {}
         self._state_access_times: OrderedDict[str, float] = OrderedDict()
+        self._first_chunk_graphs: dict[int, FirstChunkVAEGraph] = {}
+
+    def chunked_decode_streaming(
+        self,
+        latent_chunk: torch.Tensor,
+        *,
+        request_id: str,
+        finished: bool,
+    ) -> tuple[torch.Tensor, Any, Any, bool, bool]:
+        patch_count = latent_chunk.shape[0]
+        if (
+            latent_chunk.is_cuda
+            and torch.version.hip is None
+            and patch_count in (2, 4)
+            and not finished
+            and request_id not in self._past_key_values
+            and request_id not in self._stream_state
+        ):
+            if patch_count not in self._first_chunk_graphs:
+                self._first_chunk_graphs[patch_count] = FirstChunkVAEGraph(self.audio, latent_chunk)
+            waveform, stream_state, past_key_values = self._first_chunk_graphs[patch_count].replay(latent_chunk)
+            return waveform, stream_state, past_key_values, False, False
+        return super().chunked_decode_streaming(latent_chunk, request_id=request_id, finished=finished)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         weights = list(weights)
