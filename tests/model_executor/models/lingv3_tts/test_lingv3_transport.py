@@ -97,3 +97,53 @@ def test_sync_transport_preserves_all_accumulated_latents():
     prompts = llm2audio_vae([stage_output])
     assert len(prompts) == 1
     assert torch.equal(prompts[0]["additional_information"]["latent"], latents)
+
+
+@pytest.mark.parametrize(
+    ("schedule", "expected_sizes"),
+    [
+        ([2, 4, 6, 8, 10, 12, 14, 16], [2, 4, 6, 8, 10, 12, 14, 16, 16, 16, 16, 6]),
+        ([4, 6, 8, 10, 12, 14, 16], [4, 6, 8, 10, 12, 14, 16, 16, 16, 16, 8]),
+    ],
+)
+def test_async_transport_ramps_chunks_repeats_last_size_and_flushes_tail(schedule, expected_sizes):
+    manager = _manager()
+    manager.connector.config["extra"]["latent_chunk_size_schedule"] = schedule
+    request = _Request()
+    chunks = []
+    for value in range(1, 127):
+        request.finished = value == 126
+        output = llm2audio_vae_async_chunk(manager, _step(value), request)
+        if output is not None:
+            chunks.append(output)
+            manager.put_req_chunk[request.external_req_id] += 1
+
+    assert [chunk.latent.shape[0] for chunk in chunks] == expected_sizes
+    assert torch.equal(torch.cat([chunk.latent[:, 0, 0] for chunk in chunks]), torch.arange(1.0, 127.0))
+    assert all(not bool(chunk.meta.finished) for chunk in chunks[:-1])
+    assert bool(chunks[-1].meta.finished)
+    assert llm2audio_vae_async_chunk(manager, None, request) is None
+
+
+def test_async_transport_keeps_ramp_positions_per_request():
+    manager = _manager()
+    manager.connector.config["extra"]["latent_chunk_size_schedule"] = [2, 4, 6]
+    request_a = _Request("req-a")
+    request_b = _Request("req-b")
+    for value in range(1, 7):
+        output_a = llm2audio_vae_async_chunk(manager, _step(value), request_a)
+    assert output_a.latent.shape[0] == 4
+    assert llm2audio_vae_async_chunk(manager, _step(10), request_b) is None
+    output_b = llm2audio_vae_async_chunk(manager, _step(20), request_b)
+    assert output_b.latent.shape[0] == 2
+    for value in range(7, 12):
+        assert llm2audio_vae_async_chunk(manager, _step(value), request_a) is None
+    assert llm2audio_vae_async_chunk(manager, _step(12), request_a).latent.shape[0] == 6
+
+
+@pytest.mark.parametrize("schedule", [[], [2, 0], [2, -1], [2, 4.0], [True, 4], "2,4"])
+def test_async_transport_rejects_invalid_chunk_schedules(schedule):
+    manager = _manager()
+    manager.connector.config["extra"]["latent_chunk_size_schedule"] = schedule
+    with pytest.raises(ValueError, match="latent_chunk_size_schedule"):
+        llm2audio_vae_async_chunk(manager, _step(1), _Request())

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage transport for LingV3 continuous latents."""
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ def _patches(output: Mapping[str, Any] | None) -> torch.Tensor | None:
     return patch.detach().to("cpu", dtype=torch.float32)
 
 
-def _chunk_sizes(transfer_manager: Any) -> tuple[int, int]:
+def _chunk_size(transfer_manager: Any, chunk_index: int) -> int:
     connector = getattr(transfer_manager, "connector", None)
     raw = getattr(connector, "config", {}) or {}
     config = raw.get("extra", raw) if isinstance(raw, Mapping) else {}
@@ -55,7 +55,14 @@ def _chunk_sizes(transfer_manager: Any) -> tuple[int, int]:
         raise ValueError(f"Invalid LingV3 chunk sizes: initial={initial}, chunk={chunk}")
     if left != 0:
         raise ValueError("LingV3 streaming AudioVAE uses cached state; latent_left_context must be 0")
-    return chunk, initial
+    schedule = config.get("latent_chunk_size_schedule")
+    if schedule is not None:
+        if not isinstance(schedule, (list, tuple)) or not schedule:
+            raise ValueError("LingV3 latent_chunk_size_schedule must be a non-empty list of positive integers")
+        if any(isinstance(size, bool) or not isinstance(size, int) or size <= 0 for size in schedule):
+            raise ValueError("LingV3 latent_chunk_size_schedule must contain only positive integers")
+        return schedule[min(chunk_index, len(schedule) - 1)]
+    return initial if chunk_index == 0 and initial else chunk
 
 
 def llm2audio_vae_async_chunk(
@@ -69,7 +76,7 @@ def llm2audio_vae_async_chunk(
     finished = bool(is_finished or request.is_finished())
     state_root = transfer_manager.request_payload.get(request_id)
     if not isinstance(state_root, dict) or "_lingv3_async_state" not in state_root:
-        state_root = {"_lingv3_async_state": {"seen": 0, "terminal": False}}
+        state_root = {"_lingv3_async_state": {"seen": 0, "chunks": 0, "terminal": False}}
         transfer_manager.request_payload[request_id] = state_root
     state = state_root["_lingv3_async_state"]
     if state["terminal"]:
@@ -81,7 +88,7 @@ def llm2audio_vae_async_chunk(
     buffered = transfer_manager.code_prompt_token_ids[request_id]
     seen = int(state["seen"])
     available = len(buffered) - seen
-    chunk_size, initial_size = _chunk_sizes(transfer_manager)
+    target = _chunk_size(transfer_manager, int(state["chunks"]))
     if available <= 0:
         if not finished:
             return None
@@ -98,12 +105,12 @@ def llm2audio_vae_async_chunk(
             },
         )
 
-    target = initial_size if seen == 0 and initial_size else chunk_size
     if not finished and available < target:
         return None
     count = available if finished else target
     latent = torch.stack(buffered[seen : seen + count], dim=0)
     state["seen"] = seen + count
+    state["chunks"] += 1
     state["terminal"] = finished
     return OmniPayloadStruct(
         codes=CodesStruct(audio=torch.tensor([0], dtype=torch.long)),

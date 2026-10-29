@@ -9,8 +9,9 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      latent_chunk_size: 25
-      initial_latent_chunk_size: 2
+      latent_chunk_size: 16
+      initial_latent_chunk_size: 4
+      latent_chunk_size_schedule: [4, 6, 8, 10, 12, 14, 16]
       latent_left_context: 0
 
 stages:
