@@ -12,6 +12,7 @@ from .prompt_utils import create_instruction
 DEFAULT_IP_VOICE = "灵小柔"
 _DATA_DIR = Path(__file__).parent / "data"
 _IP_VOICES = {name.lower(): name for name in json.loads((_DATA_DIR / "ip_voices.json").read_text(encoding="utf-8"))}
+_IP_VOICE_ALIASES = json.loads((_DATA_DIR / "ip_voice_aliases.json").read_text(encoding="utf-8"))
 
 
 def ip_voice_names() -> tuple[str, ...]:
@@ -20,8 +21,9 @@ def ip_voice_names() -> tuple[str, ...]:
 
 
 def ip_voice_name(value: str) -> str | None:
-    """Return the model's canonical IP caption, preserving its case."""
-    return _IP_VOICES.get(value.strip().lower())
+    """Resolve a built-in name or English alias to the model's canonical IP caption."""
+    key = value.strip().lower()
+    return _IP_VOICES.get(_IP_VOICE_ALIASES.get(key, key).lower())
 
 
 def validate_voice_controls(controls: dict[str, Any]) -> None:

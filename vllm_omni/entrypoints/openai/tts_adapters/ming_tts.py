@@ -11,6 +11,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
+from vllm_omni.model_executor.models.ming_flash_omni.omni_voice import ip_voice_name
 from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import DEFAULT_PROMPT as MING_DEFAULT_PROMPT
 from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
 
@@ -37,6 +38,8 @@ def parse_ming_instruction_fields(server, request, *, include_voice=False, plain
             instruction_dict["风格"] = instruction_text
         else:
             return instruction_text
+    if isinstance(instruction_dict.get("IP"), str):
+        instruction_dict["IP"] = ip_voice_name(instruction_dict["IP"]) or instruction_dict["IP"]
     return instruction_dict or None
 
 

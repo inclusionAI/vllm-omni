@@ -281,6 +281,7 @@ vllm_omni/_version.py
 !vllm_omni/model_executor/models/ming_flash_omni/data/
 vllm_omni/model_executor/models/ming_flash_omni/data/*
 !vllm_omni/model_executor/models/ming_flash_omni/data/ip_voices.json
+!vllm_omni/model_executor/models/ming_flash_omni/data/ip_voice_aliases.json
 .worktrees/
 # CI overlay yamls materialized from tests/utils.py:_CI_OVERLAYS at test time
 tests/.ci_generated/

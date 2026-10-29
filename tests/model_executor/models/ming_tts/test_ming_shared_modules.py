@@ -399,3 +399,15 @@ def test_ming_compute_logits_text_mode_delegates_to_backbone():
 
     assert torch.equal(model.model.hidden_states, hidden_states)
     assert torch.equal(logits, torch.ones((2, 3)))
+
+
+@pytest.mark.parametrize("voice, expected", [("ling_xiaorou", "灵小柔"), ("灵小柔", "灵小柔"), ("unknown", "unknown")])
+@pytest.mark.parametrize("as_instruction", [False, True])
+def test_ming_shared_instruction_parser_resolves_voice_aliases(voice, expected, as_instruction):
+    serving = SimpleNamespace(uploaded_speakers={})
+    request = SimpleNamespace(
+        voice=None if as_instruction else voice,
+        instructions=('{"IP": "' + voice + '"}') if as_instruction else None,
+    )
+    result = parse_ming_instruction_fields(serving, request, include_voice=not as_instruction)
+    assert result == {"IP": expected}
