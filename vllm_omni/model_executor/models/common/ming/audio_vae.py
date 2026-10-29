@@ -79,6 +79,15 @@ class StreamingLinearUpsample(nn.Module):
         if x is None and not is_last:
             return None, state
 
+        if x is None:
+            pending = state["prev_chunk"].transpose(1, 2)
+            history = state["history_last"]
+            if history is None:
+                out = self.upsampler(pending)
+            else:
+                out = self.upsampler(torch.cat([history, pending], dim=2))[:, :, self.scale_factor :]
+            return out.transpose(1, 2), None
+
         if state["is_first"] and is_last:
             out = self.upsampler(x.transpose(1, 2)).transpose(1, 2)
             return out, None
@@ -219,17 +228,25 @@ class Decoder(nn.Module):
         if stream_state is None:
             stream_state = (None, None, None)
         upsample_state, audio_buffer, window_buffer = stream_state
-        bsz, device, dtype = x.size(0), x.device, x.dtype
-        x = self.fc1(x)
-        if self.patch_size != -1:
-            if use_cache:
-                x, upsample_state = self.upsampling(x, state=upsample_state, is_last=last_chunk)
-                if x is None:
-                    stream_state = (upsample_state, audio_buffer, window_buffer)
-                    return torch.empty(bsz, 1, 0, device=device, dtype=dtype), stream_state, past_key_values
-            else:
-                # [Batch, Time, Dimension] -> [Batch, Dimension, Time] -> [Batch, Time, Dimension].
-                x = self.upsampling.upsampler(x.transpose(1, 2)).transpose(1, 2)
+        if x is None:
+            if not use_cache or not last_chunk:
+                raise ValueError("Empty AudioVAE input is only valid for a final streaming flush.")
+            if self.patch_size == -1:
+                waveform = self.head.istft.flush(audio_buffer, window_buffer)
+                return waveform.unsqueeze(1), (None, None, None), past_key_values
+            x, upsample_state = self.upsampling(None, state=upsample_state, is_last=True)
+        else:
+            bsz, device, dtype = x.size(0), x.device, x.dtype
+            x = self.fc1(x)
+            if self.patch_size != -1:
+                if use_cache:
+                    x, upsample_state = self.upsampling(x, state=upsample_state, is_last=last_chunk)
+                    if x is None:
+                        stream_state = (upsample_state, audio_buffer, window_buffer)
+                        return torch.empty(bsz, 1, 0, device=device, dtype=dtype), stream_state, past_key_values
+                else:
+                    # [Batch, Time, Dimension] -> [Batch, Dimension, Time] -> [Batch, Time, Dimension].
+                    x = self.upsampling.upsampler(x.transpose(1, 2)).transpose(1, 2)
 
         hidden_states_list = []
 
@@ -392,6 +409,14 @@ class AudioVAE(PreTrainedModel):
     def decode(self, latent, past_key_values=None, use_cache=False, stream_state=(None, None, None), last_chunk=False):
         if self.decoder is None:
             raise RuntimeError("AudioVAE decoder is unavailable in encoder-only mode.")
+        if latent is None:
+            return self.decoder.low_level_reconstruct(
+                None,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                stream_state=stream_state,
+                last_chunk=last_chunk,
+            )
         if latent.dim() != 3:
             raise ValueError(f"Expected latent rank-3 [B,T,D], got shape={tuple(latent.shape)}")
         if latent.shape[0] <= 0:

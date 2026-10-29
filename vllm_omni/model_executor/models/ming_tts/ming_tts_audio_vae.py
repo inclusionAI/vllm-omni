@@ -97,6 +97,22 @@ class MingAudioVAEModel(nn.Module):
         )
         return waveform_flat, stream_state, past_key_values, had_past_key_values, had_stream_state
 
+    def _finish_request_audio(self, request_id: str) -> torch.Tensor:
+        stream_state = self._stream_state.get(request_id)
+        if _has_stream_state(stream_state):
+            waveform, _, _ = self.audio.decode(
+                None,
+                past_key_values=self._past_key_values.get(request_id),
+                use_cache=True,
+                stream_state=stream_state,
+                last_chunk=True,
+            )
+            output = waveform.reshape(-1).to(torch.float32)
+        else:
+            output = next(self.audio.parameters()).new_empty((0,), dtype=torch.float32)
+        self._clear_request_state(request_id)
+        return output
+
     @torch.inference_mode()
     def forward(
         self,
@@ -166,9 +182,7 @@ class MingAudioVAEModel(nn.Module):
                         "Ming Stage-2 received no latent chunk for an unfinished request. "
                         f"request_id={request_id} chunk_id={chunk_id} keys={sorted(info.keys())}"
                     )
-                if finished:
-                    self._clear_request_state(request_id)
-                outputs.append(empty)
+                outputs.append(self._finish_request_audio(request_id) if finished else empty)
                 srs.append(sr_tensor)
                 continue
 
@@ -185,9 +199,7 @@ class MingAudioVAEModel(nn.Module):
                         "Ming Stage-2 received an empty latent chunk before final flush. "
                         f"request_id={request_id} chunk_id={chunk_id} latent_shape={_shape_of(latent_tensor)}"
                     )
-                if finished:
-                    self._clear_request_state(request_id)
-                outputs.append(empty)
+                outputs.append(self._finish_request_audio(request_id))
                 srs.append(sr_tensor)
                 continue
 

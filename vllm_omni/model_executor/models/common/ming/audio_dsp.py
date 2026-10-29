@@ -59,6 +59,15 @@ class ISTFT(nn.Module):
 
         return x, buffer
 
+    def flush(self, audio_buffer: torch.Tensor, window_buffer: torch.Tensor) -> torch.Tensor:
+        if self.padding != "same" or audio_buffer is None or window_buffer is None:
+            raise ValueError("ISTFT flush requires cached audio and window buffers with same padding.")
+        samples = self.buffer_len - self.buffer_len // 2
+        envelope = window_buffer[..., :samples]
+        if not (envelope > 1e-11).all():
+            raise RuntimeError("ISTFT window envelope underflowed; invalid overlap-add state.")
+        return audio_buffer[..., :samples] / envelope
+
     def forward(
         self,
         spec: torch.Tensor,
