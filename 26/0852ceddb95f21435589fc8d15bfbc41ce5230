@@ -1,0 +1,19 @@
+recipes/inclusionAI/LingV3-TTS.md
+  s_f8df00ccab4355::t_be5f63de1bc100 3,9,113-209,213-217
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "260852ceddb95f21435589fc8d15bfbc41ce5230",
+  "prompts": {},
+  "sessions": {
+    "s_f8df00ccab4355": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19c63-df5c-7da1-82b3-7b3f3fde579f",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "禾波 <yangrunhe.yrh@antgroup.com>"
+    }
+  }
+}

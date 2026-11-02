@@ -1,0 +1,25 @@
+tests/model_executor/models/lingv3_tts/test_lingv3_contract.py
+  s_f8df00ccab4355::t_c609d604930fc2 253-260,263-265,269-276,279,1205
+examples/offline_inference/text_to_speech/lingv3_tts/end2end.py
+  s_f8df00ccab4355::t_c609d604930fc2 146
+vllm_omni/entrypoints/openai/tts_adapters/lingv3_tts.py
+  s_f8df00ccab4355::t_c609d604930fc2 226
+vllm_omni/model_executor/models/lingv3_tts/prompt_assembly.py
+  s_f8df00ccab4355::t_c609d604930fc2 7,19-22,148,158-167,219
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "fb7ed8fbb0256c0334d55f2541f8568eb3eb9fcf",
+  "prompts": {},
+  "sessions": {
+    "s_f8df00ccab4355": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a19c63-df5c-7da1-82b3-7b3f3fde579f",
+        "model": "gpt-6-astra"
+      },
+      "human_author": "禾波 <yangrunhe.yrh@antgroup.com>"
+    }
+  }
+}
