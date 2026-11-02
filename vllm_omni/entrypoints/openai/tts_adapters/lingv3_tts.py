@@ -29,7 +29,6 @@ from vllm_omni.model_executor.models.lingv3_tts.prompt_assembly import (
     normalize_target_language,
     resolve_podcast_decode_window,
 )
-from vllm_omni.model_executor.models.ming_tts.prompt_assembly import create_instruction
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -224,7 +223,7 @@ class LingV3TTSAdapter(ARTTSAdapter):
             reference_sample_rate=sample_rate,
             target_language=self._target_language(request),
             prompt_text=request.ref_text,
-            instruction=create_instruction(self._instruction(request.instructions)),
+            instruction=self._instruction(request.instructions),
             max_decode_steps=max_steps,
             speaker_slot=not self._is_emergent(request),
         )

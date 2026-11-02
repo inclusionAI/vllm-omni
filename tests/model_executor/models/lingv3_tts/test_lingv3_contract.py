@@ -250,17 +250,33 @@ def test_prompt_eos_contract(eos_id):
 
 
 @pytest.mark.parametrize(
-    "controls", [{"语速": "快速", "基频": "中", "音量": "高"}, {"情感": "高兴"}, {"方言": "广粤话"}]
+    "controls",
+    [
+        {"语速": "快速", "基频": "中", "音量": "高"},
+        {"情感": "高兴"},
+        {"方言": "广粤话"},
+        {"风格": "温柔"},
+        {"IP": "阿狸"},
+    ],
 )
 def test_control_caption_precedes_audio(controls):
-    from vllm_omni.model_executor.models.ming_tts.prompt_assembly import create_instruction
+    import json
+
+    from vllm_omni.entrypoints.openai.tts_adapters.lingv3_tts import LingV3TTSAdapter
 
     tokenizer = FakeTokenizer()
     tokenizer.special["<|endoftext|>"] = 156892
-    caption = create_instruction(controls)
+    caption = LingV3TTSAdapter._instruction(json.dumps(controls, ensure_ascii=False))
+    fields = ["序号", "说话人", "方言", "风格", "语速", "基频", "音量", "情感", "BGM", "IP"]
+    if set(controls) != {"情感"}:
+        fields.remove("情感")
+        fields.insert(3, "情感")
+    item = {"序号": 1, "说话人": "speaker_1", **controls}
+    item["BGM"] = dict.fromkeys(["Genre", "Mood", "Instrument", "Theme", "ENV", "SNR"])
+    expected_caption = json.dumps({"audio_sequence": [{key: item.get(key) for key in fields}]}, ensure_ascii=False)
     actual, speaker_position, _ = build_lingv3_prompt_token_ids(tokenizer, target_text="测试文本", instruction=caption)
     base, _, _ = build_lingv3_prompt_token_ids(tokenizer, target_text="测试文本")
-    expected = base[:-1] + tokenizer.encode(caption) + [156892, AUDIO_START_TOKEN_ID]
+    expected = base[:-1] + tokenizer.encode(expected_caption) + [156892, AUDIO_START_TOKEN_ID]
     assert actual == expected
     assert actual[speaker_position] == AUDIO_PATCH_TOKEN_ID
     assert actual[-2:] == [156892, AUDIO_START_TOKEN_ID]
@@ -1186,6 +1202,7 @@ def test_full_structured_instruction_preserves_archived_token_order():
     raw = json.dumps(caption, ensure_ascii=False)
     normalized = create_instruction({"方言": "川渝话"})
     assert json.loads(normalized) == caption and normalized != raw
+
     instruction = LingV3TTSAdapter._instruction(raw)
     assert instruction == raw
     tokenizer = FakeTokenizer()

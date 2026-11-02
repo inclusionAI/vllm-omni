@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 from functools import lru_cache
 from typing import Any
 
@@ -15,7 +16,10 @@ from vllm_omni.model_executor.models.ming_tts.audio_prep import (
     count_prompt_waveform_patches,
     pad_prompt_waveform,
 )
-from vllm_omni.model_executor.models.ming_tts.prompt_assembly import build_moe_prompt_token_ids
+from vllm_omni.model_executor.models.ming_tts.prompt_assembly import (
+    BASE_CAPTION_TEMPLATE,
+    build_moe_prompt_token_ids,
+)
 
 from .constants import (
     AUDIO_END_TOKEN_ID,
@@ -141,7 +145,7 @@ def build_lingv3_prompt_token_ids(
     target_text: str,
     prompt_text: str | None = None,
     prompt_latent_steps: int = 0,
-    instruction: str | None = None,
+    instruction: str | dict[str, str] | None = None,
     speaker_count: int = 1,
     target_language: str | None = None,
 ) -> tuple[list[int], int | None, int | None]:
@@ -151,6 +155,16 @@ def build_lingv3_prompt_token_ids(
         raise ValueError("prompt_text must be non-empty when provided")
     if prompt_latent_steps and prompt_text is None:
         raise ValueError("prompt_text is required when prompt latents are present")
+    if isinstance(instruction, dict):
+        template = BASE_CAPTION_TEMPLATE["audio_sequence"][0]
+        # Tiny's emotion task retains a different archived field order.
+        fields = (
+            tuple(template)
+            if set(instruction) == {"情感"}
+            else ("序号", "说话人", "方言", "情感", "风格", "语速", "基频", "音量", "BGM", "IP")
+        )
+        item = {key: instruction.get(key, template[key]) for key in fields}
+        instruction = json.dumps({"audio_sequence": [item]}, ensure_ascii=False)
     validate_lingv3_tokenizer(tokenizer)
     target_language = normalize_target_language(target_language)
     if speaker_count < 0:
@@ -202,7 +216,7 @@ def build_lingv3_prompt(
     prompt_text: str | None = None,
     speaker_embedding: Any = None,
     max_decode_steps: int | None = None,
-    instruction: str | None = None,
+    instruction: str | dict[str, str] | None = None,
     target_language: str | None = None,
     speaker_slot: bool = True,
 ) -> dict[str, Any]:

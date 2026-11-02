@@ -20,7 +20,6 @@ from vllm_omni.model_executor.models.lingv3_tts.constants import (
     MAX_DECODE_STEPS,
 )
 from vllm_omni.model_executor.models.lingv3_tts.prompt_assembly import build_lingv3_prompt
-from vllm_omni.model_executor.models.ming_tts.prompt_assembly import create_instruction
 
 DEPLOY_CONFIG = Path(__file__).resolve().parents[4] / "vllm_omni/deploy/lingv3_tts.yaml"
 TASKS = (
@@ -144,7 +143,7 @@ def build_instruction(args):
     fields = CONTROL_FIELDS.get(args.task)
     if fields is None:
         return None
-    return create_instruction({label: getattr(args, name) for name, label in fields.items()})
+    return {label: getattr(args, name) for name, label in fields.items()}
 
 
 def load_references(paths):
