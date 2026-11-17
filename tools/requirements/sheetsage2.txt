@@ -1,6 +1,6 @@
 # Isolated preprocessing environment; do not install into the Omni server venv.
 # Matches m-a-p/SheetSage2 at cafc0df1021e14f49e928c4b345f5959d414ef64.
-torch==2.8.0
+torch==2.13.0
 torchaudio==2.8.0
 transformers==4.45.2
 huggingface-hub==0.36.0
